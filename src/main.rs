@@ -47,16 +47,19 @@ impl actix_web::error::ResponseError for ServiceError {
             | ServiceError::Ipfs(_)
             | ServiceError::InvalidUri(_)
             | ServiceError::UrlError(_) => {
+                error!("Service error: {}", self);
                 HttpResponse::InternalServerError().json(ErrorResponse {
                     error: "Service unavailable".to_string(),
                     message: "Something went wrong".to_string(),
                 })
             }
-            ServiceError::Io(_) | ServiceError::Internal => HttpResponse::InternalServerError()
-                .json(ErrorResponse {
+            ServiceError::Io(_) | ServiceError::Internal => {
+                error!("Internal error: {}", self);
+                HttpResponse::InternalServerError().json(ErrorResponse {
                     error: "Internal server error".to_string(),
                     message: "An unexpected error occurred".to_string(),
-                }),
+                })
+            }
         }
     }
 }
@@ -250,20 +253,30 @@ impl IPFSService {
         }
 
         let mut conn = self.db_pool.get_conn().await?;
-        let result: Option<(String, String, u64, String)> = conn
-            .exec_first(
-                "SELECT cid, name, size, timestamp FROM file_metadata WHERE cid = :cid",
-                params! { "cid" => cid },
-            )
+        let result = conn
+            .query_first::<mysql_async::Row, _>(format!(
+                "SELECT cid, name, size, timestamp FROM file_metadata WHERE cid = '{}'",
+                cid
+            ))
             .await?;
 
-        Ok(result.map(|(cid, name, size, timestamp)| FileMetadata {
-            cid,
-            name,
-            size,
-            timestamp: DateTime::parse_from_rfc3339(&timestamp)
-                .unwrap_or_else(|_| Utc::now().into())
-                .into(),
+        Ok(result.map(|row| {
+            let cid: String = row.get("cid").expect("CID should be present");
+            let name: String = row.get("name").expect("Name should be present");
+            let size: u64 = row.get("size").expect("Size should be present");
+            let timestamp_str: String = row.get("timestamp").expect("Timestamp should be present");
+
+            FileMetadata {
+                cid,
+                name,
+                size,
+                timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
+                    .unwrap_or_else(|e| {
+                        warn!("Failed to parse timestamp '{}': {}", timestamp_str, e);
+                        Utc::now().into()
+                    })
+                    .into(),
+            }
         }))
     }
 }
