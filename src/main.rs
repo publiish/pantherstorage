@@ -4,10 +4,13 @@ use dotenv::dotenv;
 use env_logger::Env;
 use futures::stream::StreamExt;
 use hyper::http::uri::InvalidUri;
+use hyper::{Body, Client, Method, Request};
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
+use ipfs_api_prelude::ApiError;
 use log::{debug, error, info, warn};
 use mysql_async::{prelude::*, Opts, Pool};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use serde_with::{serde_as, DisplayFromStr};
 use std::{
     env,
@@ -117,12 +120,17 @@ impl Config {
 struct IPFSService {
     client: IpfsClient,
     db_pool: Pool,
+    url: String,
 }
 
 impl IPFSService {
     async fn new(config: &Config) -> Result<Self, ServiceError> {
         let client = IpfsClient::from_str(&config.ipfs_node)?;
-        info!("Connected to IPFS node: {}", config.ipfs_node);
+        let version = client.version().await?;
+        info!(
+            "Connected to IPFS node: {} (version: {})",
+            config.ipfs_node, version.version
+        );
 
         let opts = Opts::from_url(&config.database_url)?;
         let pool = Pool::new(opts);
@@ -144,6 +152,7 @@ impl IPFSService {
         Ok(Self {
             client,
             db_pool: pool,
+            url: config.ipfs_node.clone(),
         })
     }
 
@@ -248,8 +257,38 @@ impl IPFSService {
     }
 
     async fn list_pins(&self) -> Result<Vec<String>, ServiceError> {
-        let pins = self.client.pin_ls(Some("recursive"), None).await?;
-        Ok(pins.keys.into_iter().map(|(cid, _)| cid).collect())
+        let client = Client::new();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{}/api/v0/pin/ls?type=recursive", self.url))
+            .body(Body::empty())
+            .map_err(|_e| ServiceError::Internal)?;
+
+        let response = client.request(req).await.map_err(|e| {
+            ServiceError::Ipfs(ipfs_api::Error::Api(ApiError {
+                message: e.to_string(),
+                code: 0,
+            }))
+        })?;
+
+        let bytes = hyper::body::to_bytes(response.into_body())
+            .await
+            .map_err(|e| {
+                ServiceError::Ipfs(ipfs_api::Error::Api(ApiError {
+                    message: e.to_string(),
+                    code: 0,
+                }))
+            })?;
+
+        let json: Value = serde_json::from_slice(&bytes).map_err(|_e| ServiceError::Internal)?;
+        let keys = json
+            .get("Keys")
+            .ok_or(ServiceError::Internal)?
+            .as_object()
+            .ok_or(ServiceError::Internal)?;
+
+        let cids: Vec<String> = keys.keys().cloned().collect();
+        Ok(cids)
     }
 
     async fn get_file_metadata(&self, cid: &str) -> Result<Option<FileMetadata>, ServiceError> {
@@ -277,7 +316,7 @@ impl IPFSService {
                 cid,
                 name,
                 size,
-                timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
+                timestamp: DateTime::parse_from_str(&timestamp_str, "%Y-%m-%d %H:%M:%S")
                     .unwrap_or_else(|e| {
                         warn!("Failed to parse timestamp '{}': {}", timestamp_str, e);
                         Utc::now().into()
@@ -335,7 +374,7 @@ async fn get_metadata(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let config = Config::from_env().expect("Failed to load configuration");
 
     debug!("Initializing IPFS service...");
@@ -355,15 +394,13 @@ async fn main() -> std::io::Result<()> {
     info!("Starting server at {}", bind_address);
 
     HttpServer::new(move || {
-        let app = App::new()
+        App::new()
             .app_data(web::Data::new(service.clone()))
             .route("/upload", web::post().to(upload))
             .route("/download", web::post().to(download))
             .route("/delete", web::post().to(delete))
             .route("/pins", web::get().to(list_pins))
-            .route("/metadata/{cid}", web::get().to(get_metadata));
-        debug!("Application routes configured");
-        app
+            .route("/metadata/{cid}", web::get().to(get_metadata))
     })
     .bind(&bind_address)?
     .run()
