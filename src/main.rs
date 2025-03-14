@@ -1,6 +1,4 @@
-use actix_web::{
-    error::Error as ActixError, web, App, HttpResponse, HttpServer,
-};
+use actix_web::{error::Error as ActixError, web, App, HttpResponse, HttpServer};
 use chrono::{DateTime, Utc};
 use dotenv::dotenv;
 use env_logger::Env;
@@ -8,10 +6,16 @@ use futures::stream::StreamExt;
 use hyper::http::uri::InvalidUri;
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
 use log::{debug, error, info, warn};
-use mysql_async::{Opts, Pool, prelude::*};
+use mysql_async::{prelude::*, Opts, Pool};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::{env, fs::File, io::{Cursor, Read}, path::Path, sync::Arc};
+use std::{
+    env,
+    fs::File,
+    io::{Cursor, Read},
+    path::Path,
+    sync::Arc,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,18 +43,20 @@ impl actix_web::error::ResponseError for ServiceError {
                 error: "Invalid input".to_string(),
                 message: msg.to_string(),
             }),
-            ServiceError::Database(_) | ServiceError::Ipfs(_) | ServiceError::InvalidUri(_) | ServiceError::UrlError(_) => {
+            ServiceError::Database(_)
+            | ServiceError::Ipfs(_)
+            | ServiceError::InvalidUri(_)
+            | ServiceError::UrlError(_) => {
                 HttpResponse::InternalServerError().json(ErrorResponse {
                     error: "Service unavailable".to_string(),
                     message: "Something went wrong".to_string(),
                 })
             }
-            ServiceError::Io(_) | ServiceError::Internal => {
-                HttpResponse::InternalServerError().json(ErrorResponse {
+            ServiceError::Io(_) | ServiceError::Internal => HttpResponse::InternalServerError()
+                .json(ErrorResponse {
                     error: "Internal server error".to_string(),
                     message: "An unexpected error occurred".to_string(),
-                })
-            }
+                }),
         }
     }
 }
@@ -97,7 +103,8 @@ impl Config {
     fn from_env() -> Result<Self, env::VarError> {
         dotenv().ok();
         Ok(Config {
-            ipfs_node: env::var("IPFS_NODE").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string()),
+            ipfs_node: env::var("IPFS_NODE")
+                .unwrap_or_else(|_| "http://127.0.0.1:5001".to_string()),
             database_url: env::var("DATABASE_URL")?,
             bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
         })
@@ -131,7 +138,10 @@ impl IPFSService {
         .await?;
         info!("Database schema initialized");
 
-        Ok(Self { client, db_pool: pool })
+        Ok(Self {
+            client,
+            db_pool: pool,
+        })
     }
 
     async fn upload_file(&self, file_path: &str) -> Result<FileMetadata, ServiceError> {
@@ -185,7 +195,9 @@ impl IPFSService {
 
     async fn download_file(&self, cid: &str, output_path: &str) -> Result<(), ServiceError> {
         if cid.trim().is_empty() {
-            return Err(ServiceError::InvalidInput("CID cannot be empty".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "CID cannot be empty".to_string(),
+            ));
         }
 
         let mut stream = self.client.cat(cid);
@@ -202,7 +214,9 @@ impl IPFSService {
 
     async fn delete_file(&self, cid: &str) -> Result<(), ServiceError> {
         if cid.trim().is_empty() {
-            return Err(ServiceError::InvalidInput("CID cannot be empty".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "CID cannot be empty".to_string(),
+            ));
         }
 
         self.client.pin_rm(cid, true).await?;
@@ -212,7 +226,8 @@ impl IPFSService {
         conn.exec_drop(
             "DELETE FROM file_metadata WHERE cid = :cid",
             params! { "cid" => cid },
-        ).await?;
+        )
+        .await?;
         let affected = conn.affected_rows();
         if affected > 0 {
             info!("File metadata deleted: {}", cid);
@@ -229,7 +244,9 @@ impl IPFSService {
 
     async fn get_file_metadata(&self, cid: &str) -> Result<Option<FileMetadata>, ServiceError> {
         if cid.trim().is_empty() {
-            return Err(ServiceError::InvalidInput("CID cannot be empty".to_string()));
+            return Err(ServiceError::InvalidInput(
+                "CID cannot be empty".to_string(),
+            ));
         }
 
         let mut conn = self.db_pool.get_conn().await?;
@@ -240,14 +257,13 @@ impl IPFSService {
             )
             .await?;
 
-        Ok(result.map(|(cid, name, size, timestamp)| {
-            FileMetadata {
-                cid,
-                name,
-                size,
-                timestamp: DateTime::parse_from_rfc3339(&timestamp)
-                    .unwrap_or_else(|_| Utc::now().into()).into(),
-            }
+        Ok(result.map(|(cid, name, size, timestamp)| FileMetadata {
+            cid,
+            name,
+            size,
+            timestamp: DateTime::parse_from_rfc3339(&timestamp)
+                .unwrap_or_else(|_| Utc::now().into())
+                .into(),
         }))
     }
 }
@@ -299,25 +315,35 @@ async fn get_metadata(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
     let config = Config::from_env().expect("Failed to load configuration");
 
-    let service = Arc::new(
-        IPFSService::new(&config)
-            .await
-            .expect("Failed to initialize IPFS service"),
-    );
-    let bind_address = config.bind_address.clone();
+    debug!("Initializing IPFS service...");
+    let service = match IPFSService::new(&config).await {
+        Ok(service) => Arc::new(service),
+        Err(e) => {
+            error!("Failed to initialize IPFS service: {}", e);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ));
+        }
+    };
+    debug!("IPFS service initialized successfully");
 
+    let bind_address = config.bind_address.clone();
     info!("Starting server at {}", bind_address);
+
     HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::from(service.clone()))
+        let app = App::new()
+            .app_data(web::Data::new(service.clone()))
             .route("/upload", web::post().to(upload))
             .route("/download", web::post().to(download))
             .route("/delete", web::post().to(delete))
             .route("/pins", web::get().to(list_pins))
-            .route("/metadata/{cid}", web::get().to(get_metadata))
+            .route("/metadata/{cid}", web::get().to(get_metadata));
+        debug!("Application routes configured");
+        app
     })
     .bind(&bind_address)?
     .run()
