@@ -155,7 +155,14 @@ impl IPFSService {
             )));
         }
 
-        let mut file = File::open(file_path)?;
+        // let mut file = File::open(file_path)?;
+        let mut file = File::open(file_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                ServiceError::Io(e)
+            } else {
+                ServiceError::Internal
+            }
+        })?;
         let file_size = file.metadata()?.len();
         let file_name = Path::new(file_path)
             .file_name()
