@@ -1,14 +1,65 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
-use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::{self, Cursor, Read};
-// use bytes::Bytes;
+use actix_web::{
+    error::Error as ActixError, web, App, HttpResponse, HttpServer,
+};
 use chrono::{DateTime, Utc};
+use dotenv::dotenv;
+use env_logger::Env;
 use futures::stream::StreamExt;
-use mysql::prelude::*;
-use mysql::*;
+use hyper::http::uri::InvalidUri;
+use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
+use log::{debug, error, info, warn};
+use mysql_async::{Opts, Pool, prelude::*};
+use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
+use std::{env, fs::File, io::{Cursor, Read}, path::Path, sync::Arc};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum ServiceError {
+    #[error("Database error: {0}")]
+    Database(#[from] mysql_async::Error),
+    #[error("IPFS error: {0}")]
+    Ipfs(#[from] ipfs_api::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Invalid URI: {0}")]
+    InvalidUri(#[from] InvalidUri),
+    #[error("URL parsing error: {0}")]
+    UrlError(#[from] mysql_async::UrlError),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    #[error("Internal server error")]
+    Internal,
+}
+
+impl actix_web::error::ResponseError for ServiceError {
+    fn error_response(&self) -> HttpResponse {
+        match self {
+            ServiceError::InvalidInput(msg) => HttpResponse::BadRequest().json(ErrorResponse {
+                error: "Invalid input".to_string(),
+                message: msg.to_string(),
+            }),
+            ServiceError::Database(_) | ServiceError::Ipfs(_) | ServiceError::InvalidUri(_) | ServiceError::UrlError(_) => {
+                HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Service unavailable".to_string(),
+                    message: "Something went wrong".to_string(),
+                })
+            }
+            ServiceError::Io(_) | ServiceError::Internal => {
+                HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                    message: "An unexpected error occurred".to_string(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+    message: String,
+}
 
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,61 +87,78 @@ struct DeleteRequest {
     cid: String,
 }
 
+struct Config {
+    ipfs_node: String,
+    database_url: String,
+    bind_address: String,
+}
+
+impl Config {
+    fn from_env() -> Result<Self, env::VarError> {
+        dotenv().ok();
+        Ok(Config {
+            ipfs_node: env::var("IPFS_NODE").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string()),
+            database_url: env::var("DATABASE_URL")?,
+            bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
+        })
+    }
+}
+
 struct IPFSService {
-    clients: Vec<IpfsClient>,
+    client: IpfsClient,
     db_pool: Pool,
 }
 
 impl IPFSService {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let clients = vec![
-            IpfsClient::from_str("http://127.0.0.1:5001")?,
-            IpfsClient::from_str("http://127.0.0.1:5002")?,
-            IpfsClient::from_str("http://127.0.0.1:5003")?,
-            // IpfsClient::from_str("http://ipfs0:5001")?,
-            // IpfsClient::from_str("http://ipfs1:5001")?,
-            // IpfsClient::from_str("http://ipfs2:5001")?,
-        ];
+    async fn new(config: &Config) -> Result<Self, ServiceError> {
+        let client = IpfsClient::from_str(&config.ipfs_node)?;
+        info!("Connected to IPFS node: {}", config.ipfs_node);
 
-        let pool = Pool::new("mysql://root:password@localhost:3306/publiish_local")?;
-        let mut conn = pool.get_conn()?;
+        let opts = Opts::from_url(&config.database_url)?;
+        let pool = Pool::new(opts);
+        let mut conn = pool.get_conn().await?;
+
         conn.query_drop(
             r"CREATE TABLE IF NOT EXISTS file_metadata (
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                cid VARCHAR(100) NOT NULL,
+                cid VARCHAR(100) NOT NULL UNIQUE,
                 name VARCHAR(255) NOT NULL,
                 size BIGINT NOT NULL,
-                timestamp DATETIME NOT NULL
+                timestamp DATETIME NOT NULL,
+                INDEX idx_cid (cid)
             )",
-        )?;
+        )
+        .await?;
+        info!("Database schema initialized");
 
-        Ok(Self {
-            clients,
-            db_pool: pool,
-        })
+        Ok(Self { client, db_pool: pool })
     }
 
-    async fn upload_file(
-        &self,
-        file_path: &str,
-    ) -> Result<FileMetadata, Box<dyn std::error::Error>> {
+    async fn upload_file(&self, file_path: &str) -> Result<FileMetadata, ServiceError> {
+        if !Path::new(file_path).exists() {
+            return Err(ServiceError::InvalidInput(format!(
+                "File not found: {}",
+                file_path
+            )));
+        }
+
         let mut file = File::open(file_path)?;
         let file_size = file.metadata()?.len();
-        let file_name = std::path::Path::new(file_path)
+        let file_name = Path::new(file_path)
             .file_name()
-            .unwrap()
+            .ok_or_else(|| ServiceError::InvalidInput("Invalid file path".to_string()))?
             .to_str()
-            .unwrap()
+            .ok_or_else(|| ServiceError::InvalidInput("Invalid file name".to_string()))?
             .to_string();
 
-        let mut contents = Vec::new();
+        let mut contents = Vec::with_capacity(file_size as usize);
         file.read_to_end(&mut contents)?;
         let cursor = Cursor::new(contents);
 
-        let response = self.clients[0].add(cursor).await?;
-        for client in &self.clients {
-            client.pin_add(&response.hash, true).await?;
-        }
+        let response = self.client.add(cursor).await?;
+        debug!("File added to IPFS with CID: {}", response.hash);
+        self.client.pin_add(&response.hash, true).await?;
+        debug!("File pinned: {}", response.hash);
 
         let metadata = FileMetadata {
             cid: response.hash.clone(),
@@ -99,26 +167,28 @@ impl IPFSService {
             timestamp: Utc::now(),
         };
 
-        let mut conn = self.db_pool.get_conn()?;
+        let mut conn = self.db_pool.get_conn().await?;
         conn.exec_drop(
-            "INSERT INTO file_metadata (cid, name, size, timestamp) VALUES (?, ?, ?, ?)",
-            (
-                &metadata.cid,
-                &metadata.name,
-                &metadata.size,
-                metadata.timestamp.to_rfc3339(),
-            ),
-        )?;
+            "INSERT INTO file_metadata (cid, name, size, timestamp) VALUES (:cid, :name, :size, :timestamp)",
+            params! {
+                "cid" => &metadata.cid,
+                "name" => &metadata.name,
+                "size" => &metadata.size,
+                "timestamp" => metadata.timestamp.to_rfc3339(),
+            },
+        )
+        .await?;
+        info!("File metadata stored: {}", metadata.cid);
 
         Ok(metadata)
     }
 
-    async fn download_file(
-        &self,
-        cid: &str,
-        output_path: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut stream = self.clients[0].cat(cid);
+    async fn download_file(&self, cid: &str, output_path: &str) -> Result<(), ServiceError> {
+        if cid.trim().is_empty() {
+            return Err(ServiceError::InvalidInput("CID cannot be empty".to_string()));
+        }
+
+        let mut stream = self.client.cat(cid);
         let mut bytes = Vec::new();
 
         while let Some(chunk) = stream.next().await {
@@ -126,99 +196,130 @@ impl IPFSService {
         }
 
         std::fs::write(output_path, bytes)?;
+        info!("File downloaded to: {}", output_path);
         Ok(())
     }
 
-    async fn delete_file(&self, cid: &str) -> Result<(), Box<dyn std::error::Error>> {
-        for client in &self.clients {
-            client.pin_rm(cid, true).await?;
+    async fn delete_file(&self, cid: &str) -> Result<(), ServiceError> {
+        if cid.trim().is_empty() {
+            return Err(ServiceError::InvalidInput("CID cannot be empty".to_string()));
         }
 
-        let mut conn = self.db_pool.get_conn()?;
-        conn.exec_drop("DELETE FROM file_metadata WHERE cid = ?", (cid,))?;
+        self.client.pin_rm(cid, true).await?;
+        debug!("File unpinned: {}", cid);
+
+        let mut conn = self.db_pool.get_conn().await?;
+        conn.exec_drop(
+            "DELETE FROM file_metadata WHERE cid = :cid",
+            params! { "cid" => cid },
+        ).await?;
+        let affected = conn.affected_rows();
+        if affected > 0 {
+            info!("File metadata deleted: {}", cid);
+        } else {
+            warn!("No metadata found for CID: {}", cid);
+        }
         Ok(())
     }
 
-    async fn list_pins(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let pins = self.clients[0].pin_ls(Some("recursive"), None).await?;
+    async fn list_pins(&self) -> Result<Vec<String>, ServiceError> {
+        let pins = self.client.pin_ls(Some("recursive"), None).await?;
         Ok(pins.keys.into_iter().map(|(cid, _)| cid).collect())
     }
 
-    async fn get_file_metadata(
-        &self,
-        cid: &str,
-    ) -> Result<Option<FileMetadata>, Box<dyn std::error::Error>> {
-        let mut conn = self.db_pool.get_conn()?;
-        let result: Option<(String, String, u64, String)> = conn.exec_first(
-            "SELECT cid, name, size, timestamp FROM file_metadata WHERE cid = ?",
-            (cid,),
-        )?;
+    async fn get_file_metadata(&self, cid: &str) -> Result<Option<FileMetadata>, ServiceError> {
+        if cid.trim().is_empty() {
+            return Err(ServiceError::InvalidInput("CID cannot be empty".to_string()));
+        }
 
-        Ok(result.map(|(cid, name, size, timestamp)| FileMetadata {
-            cid,
-            name,
-            size,
-            timestamp: DateTime::parse_from_rfc3339(&timestamp).unwrap().into(),
+        let mut conn = self.db_pool.get_conn().await?;
+        let result: Option<(String, String, u64, String)> = conn
+            .exec_first(
+                "SELECT cid, name, size, timestamp FROM file_metadata WHERE cid = :cid",
+                params! { "cid" => cid },
+            )
+            .await?;
+
+        Ok(result.map(|(cid, name, size, timestamp)| {
+            FileMetadata {
+                cid,
+                name,
+                size,
+                timestamp: DateTime::parse_from_rfc3339(&timestamp)
+                    .unwrap_or_else(|_| Utc::now().into()).into(),
+            }
         }))
     }
 }
 
-async fn upload(service: web::Data<IPFSService>, req: web::Json<UploadRequest>) -> impl Responder {
-    match service.upload_file(&req.file_path).await {
-        Ok(metadata) => HttpResponse::Ok().json(metadata),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    }
+async fn upload(
+    service: web::Data<Arc<IPFSService>>,
+    req: web::Json<UploadRequest>,
+) -> Result<HttpResponse, ActixError> {
+    info!("Upload request for file: {}", req.file_path);
+    let metadata = service.upload_file(&req.file_path).await?;
+    Ok(HttpResponse::Ok().json(metadata))
 }
 
 async fn download(
-    service: web::Data<IPFSService>,
+    service: web::Data<Arc<IPFSService>>,
     req: web::Json<DownloadRequest>,
-) -> impl Responder {
-    match service.download_file(&req.cid, &req.output_path).await {
-        Ok(()) => HttpResponse::Ok().body("File downloaded successfully"),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    }
+) -> Result<HttpResponse, ActixError> {
+    info!("Download request for CID: {}", req.cid);
+    service.download_file(&req.cid, &req.output_path).await?;
+    Ok(HttpResponse::Ok().body("File downloaded successfully"))
 }
 
-async fn delete(service: web::Data<IPFSService>, req: web::Json<DeleteRequest>) -> impl Responder {
-    match service.delete_file(&req.cid).await {
-        Ok(()) => HttpResponse::Ok().body("File deleted successfully"),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    }
+async fn delete(
+    service: web::Data<Arc<IPFSService>>,
+    req: web::Json<DeleteRequest>,
+) -> Result<HttpResponse, ActixError> {
+    info!("Delete request for CID: {}", req.cid);
+    service.delete_file(&req.cid).await?;
+    Ok(HttpResponse::Ok().body("File deleted successfully"))
 }
 
-async fn list_pins(service: web::Data<IPFSService>) -> impl Responder {
-    match service.list_pins().await {
-        Ok(pins) => HttpResponse::Ok().json(pins),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    }
+async fn list_pins(service: web::Data<Arc<IPFSService>>) -> Result<HttpResponse, ActixError> {
+    info!("List pins request received");
+    let pins = service.list_pins().await?;
+    Ok(HttpResponse::Ok().json(pins))
 }
 
-async fn get_metadata(service: web::Data<IPFSService>, path: web::Path<String>) -> impl Responder {
-    match service.get_file_metadata(&path.into_inner()).await {
-        Ok(Some(metadata)) => HttpResponse::Ok().json(metadata),
-        Ok(None) => HttpResponse::NotFound().body("File not found"),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+async fn get_metadata(
+    service: web::Data<Arc<IPFSService>>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, ActixError> {
+    let cid = path.into_inner();
+    info!("Metadata request for CID: {}", cid);
+    match service.get_file_metadata(&cid).await? {
+        Some(metadata) => Ok(HttpResponse::Ok().json(metadata)),
+        None => Ok(HttpResponse::NotFound().body("File not found")),
     }
 }
 
 #[actix_web::main]
-async fn main() -> io::Result<()> {
-    let service = IPFSService::new()
-        .await
-        .expect("Failed to initialize IPFS service");
-    let service_data = web::Data::new(service);
+async fn main() -> std::io::Result<()> {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    let config = Config::from_env().expect("Failed to load configuration");
 
+    let service = Arc::new(
+        IPFSService::new(&config)
+            .await
+            .expect("Failed to initialize IPFS service"),
+    );
+    let bind_address = config.bind_address.clone();
+
+    info!("Starting server at {}", bind_address);
     HttpServer::new(move || {
         App::new()
-            .app_data(service_data.clone())
+            .app_data(web::Data::from(service.clone()))
             .route("/upload", web::post().to(upload))
             .route("/download", web::post().to(download))
             .route("/delete", web::post().to(delete))
             .route("/pins", web::get().to(list_pins))
             .route("/metadata/{cid}", web::get().to(get_metadata))
     })
-    .bind("127.0.0.1:8081")?
+    .bind(&bind_address)?
     .run()
     .await
 }
