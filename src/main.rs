@@ -194,7 +194,7 @@ impl IPFSService {
                 "cid" => &metadata.cid,
                 "name" => &metadata.name,
                 "size" => &metadata.size,
-                "timestamp" => metadata.timestamp.to_rfc3339(),
+                "timestamp" => metadata.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
             },
         )
         .await?;
