@@ -193,7 +193,7 @@ impl IPFSService {
         Ok(metadata)
     }
 
-    /// Downloads a file from IPFS to the specified path
+    /// Serves file content directly from IPFS
     pub async fn download_file(
         &self,
         cid: &str,
@@ -220,6 +220,29 @@ impl IPFSService {
         std::fs::write(output_path, &bytes)?;
         info!("File downloaded by user {}: {}", user_id, cid);
         Ok(())
+    }
+
+    /// Fetches file bytes from IPFS for direct serving
+    pub async fn fetch_file_bytes(&self, cid: &str, user_id: i32) -> Result<Vec<u8>, ServiceError> {
+        let metadata = self
+            .get_file_metadata(cid)
+            .await?
+            .ok_or(ServiceError::InvalidInput("File not found".to_string()))?;
+
+        if metadata.user_id != user_id {
+            return Err(ServiceError::Auth(
+                "Not authorized to access this file".to_string(),
+            ));
+        }
+
+        let mut stream = self.client.cat(cid);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend(chunk?);
+        }
+
+        info!("File fetched by user {}: {}", user_id, cid);
+        Ok(bytes)
     }
 
     /// Deletes a file from IPFS and removes its metadata

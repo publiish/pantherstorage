@@ -4,11 +4,12 @@ use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
 use futures_util::TryStreamExt;
 use jsonwebtoken::{decode, DecodingKey, Validation};
+use mime_guess::from_path;
 use validator::Validate;
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/upload", web::post().to(upload))
-        .route("/download", web::post().to(download))
+        .route("/download/{cid}", web::get().to(download))
         .route("/delete", web::post().to(delete))
         .route("/pins", web::get().to(list_pins))
         .route("/metadata/{cid}", web::get().to(get_metadata));
@@ -46,23 +47,34 @@ async fn upload(
     Err(ServiceError::InvalidInput("No file provided in multipart data".to_string()).into())
 }
 
-/// Handles file download requests
-/// POST /api/download
+/// Serves file content directly to the browser
+/// GET /api/download/{cid}
 async fn download(
     state: web::Data<super::AppState>,
-    req: web::Json<DownloadRequest>,
+    path: web::Path<String>,
     http_req: HttpRequest,
 ) -> Result<HttpResponse, actix_web::error::Error> {
-    let inner = req.into_inner();
-    inner
-        .validate()
-        .map_err(|e| ServiceError::Validation(e.to_string()))?;
+    let cid = path.into_inner();
     let user_id = verify_token(http_req, &state.ipfs_service).await?;
-    state
+
+    let metadata = state
         .ipfs_service
-        .download_file(&inner.cid, &inner.output_path, user_id)
-        .await?;
-    Ok(HttpResponse::Ok().body("File downloaded successfully"))
+        .get_file_metadata(&cid)
+        .await?
+        .ok_or(ServiceError::InvalidInput("File not found".to_string()))?;
+
+    let file_bytes = state.ipfs_service.fetch_file_bytes(&cid, user_id).await?;
+
+    // Determine MIME type based on file extension, default to octet-stream
+    let mime_type = from_path(&metadata.name).first_or_octet_stream();
+
+    Ok(HttpResponse::Ok()
+        .content_type(mime_type.to_string())
+        .header(
+            "Content-Disposition",
+            format!("inline; filename=\"{}\"", metadata.name),
+        )
+        .body(file_bytes))
 }
 
 /// Handles file deletion requests
