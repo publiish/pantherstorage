@@ -35,15 +35,6 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Request structure for downloading files
-#[derive(Debug, Validate, Deserialize)]
-pub struct DownloadRequest {
-    #[validate(length(min = 1))]
-    pub cid: String,
-    #[validate(length(min = 1, max = 255))]
-    pub output_path: String,
-}
-
 /// Request structure for deleting files
 #[derive(Debug, Validate, Deserialize)]
 pub struct DeleteRequest {

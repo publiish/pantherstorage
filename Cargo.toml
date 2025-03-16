@@ -7,7 +7,6 @@ edition = "2021"
 actix-web = "4.4"
 actix-rt = "2.10.0"
 actix-multipart = "0.7.2"
-actix-ratelimit = "0.3.1"
 actix-service = "2.0.3"
 mime_guess = "2.0.5"
 ipfs-api = "0.17.0"
@@ -31,5 +30,3 @@ reqwest = { version = "0.12.14", features = ["stream"] }
 mysql_async = "0.34"
 thiserror = "1.0"
 validator = { version = "0.20.0", features = ["derive"] }
-
-
