@@ -3530,6 +3530,7 @@ dependencies = [
  "ipfs-api-prelude",
  "jsonwebtoken",
  "log",
+ "mime_guess",
  "mysql",
  "mysql_async",
  "reqwest",
