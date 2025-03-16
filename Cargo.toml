@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 actix-web = "4.4"
 actix-rt = "2.10.0"
+actix-multipart = "0.7.2"
 actix-ratelimit = "0.3.1"
 actix-service = "2.0.3"
 ipfs-api = "0.17.0"

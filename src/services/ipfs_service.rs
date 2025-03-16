@@ -11,11 +11,7 @@ use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use log::info;
 use mysql_async::{prelude::*, Opts, Pool};
-use std::{
-    fs::File,
-    io::{Cursor, Read},
-    path::Path,
-};
+use std::io::Cursor;
 use validator::Validate;
 
 // Service handling IPFS operations and user management
@@ -28,16 +24,6 @@ pub struct IPFSService {
 
 impl IPFSService {
     /// Initializes a new IPFS service instance
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use tokio;
-    /// # async fn example() {
-    /// let config = Config::from_env().unwrap();
-    /// let service = IPFSService::new(&config).await.unwrap();
-    /// # }
-    /// ```
     pub async fn new(config: &Config) -> Result<Self, ServiceError> {
         let client = IpfsClient::from_str(&config.ipfs_node)?;
         let version = client.version().await?;
@@ -173,28 +159,12 @@ impl IPFSService {
     /// Uploads a file to IPFS and stores its metadata
     pub async fn upload_file(
         &self,
-        file_path: &str,
+        file_contents: Vec<u8>,
+        file_name: String,
         user_id: i32,
     ) -> Result<FileMetadata, ServiceError> {
-        if !Path::new(file_path).exists() {
-            return Err(ServiceError::InvalidInput(format!(
-                "File not found: {}",
-                file_path
-            )));
-        }
-
-        let mut file = File::open(file_path)?;
-        let file_size = file.metadata()?.len();
-        let file_name = Path::new(file_path)
-            .file_name()
-            .ok_or(ServiceError::InvalidInput("Invalid file path".to_string()))?
-            .to_str()
-            .ok_or(ServiceError::InvalidInput("Invalid file name".to_string()))?
-            .to_string();
-
-        let mut contents = Vec::with_capacity(file_size as usize);
-        file.read_to_end(&mut contents)?;
-        let cursor = Cursor::new(contents);
+        let file_size = file_contents.len() as u64;
+        let cursor = Cursor::new(file_contents);
 
         let response = self.client.add(cursor).await?;
         self.client.pin_add(&response.hash, true).await?;
@@ -275,7 +245,7 @@ impl IPFSService {
 
         info!("File deleted by user {}: {}", user_id, cid);
         Ok(())
-    }   
+    }
 
     /// Lists all pinned files for a user
     pub async fn list_pins(&self, user_id: i32) -> Result<Vec<String>, ServiceError> {
@@ -305,7 +275,6 @@ impl IPFSService {
             cid: row.get("cid").unwrap(),
             name: row.get("name").unwrap(),
             size: row.get("size").unwrap(),
-            // Note: Should parse from DB in production
             timestamp: Utc::now(),
             user_id: row.get("user_id").unwrap(),
         }))
