@@ -70,10 +70,10 @@ async fn download(
 
     Ok(HttpResponse::Ok()
         .content_type(mime_type.to_string())
-        .header(
+        .append_header((
             "Content-Disposition",
             format!("inline; filename=\"{}\"", metadata.name),
-        )
+        ))
         .body(file_bytes))
 }
 
