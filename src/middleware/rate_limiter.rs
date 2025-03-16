@@ -11,6 +11,7 @@ pub struct RateLimiterMiddleware<S> {
 }
 
 impl<S> RateLimiterMiddleware<S> {
+    #[allow(dead_code)]
     pub fn new(service: S, rate_limiter: RateLimiter) -> Self {
         RateLimiterMiddleware {
             service,

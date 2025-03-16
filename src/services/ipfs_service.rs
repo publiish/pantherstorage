@@ -18,8 +18,9 @@ use validator::Validate;
 pub struct IPFSService {
     pub client: IpfsClient,
     pub db_pool: Pool,
-    pub url: String,
     pub jwt_secret: String,
+    #[allow(dead_code)]
+    pub url: String,
 }
 
 impl IPFSService {
@@ -194,6 +195,7 @@ impl IPFSService {
     }
 
     /// Serves file content directly from IPFS
+    #[allow(dead_code)]
     pub async fn download_file(
         &self,
         cid: &str,
