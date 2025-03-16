@@ -1,0 +1,129 @@
+use crate::models::auth::Claims;
+use crate::{errors::ServiceError, models::requests::*, services::ipfs_service::IPFSService};
+use actix_web::{web, HttpRequest, HttpResponse};
+use jsonwebtoken::{decode, DecodingKey, Validation};
+use validator::Validate;
+
+pub fn init_routes(cfg: &mut web::ServiceConfig) {
+    cfg.route("/upload", web::post().to(upload))
+        .route("/download", web::post().to(download))
+        .route("/delete", web::post().to(delete))
+        .route("/pins", web::get().to(list_pins))
+        .route("/metadata/{cid}", web::get().to(get_metadata));
+}
+
+/// Handles file upload requests
+/// POST /api/upload
+async fn upload(
+    state: web::Data<super::AppState>,
+    req: web::Json<UploadRequest>,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let inner = req.into_inner();
+    inner
+        .validate()
+        .map_err(|e| ServiceError::Validation(e.to_string()))?;
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+    let metadata = state
+        .ipfs_service
+        .upload_file(&inner.file_path, user_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(metadata))
+}
+
+/// Handles file download requests
+/// POST /api/download
+async fn download(
+    state: web::Data<super::AppState>,
+    req: web::Json<DownloadRequest>,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let inner = req.into_inner();
+    inner
+        .validate()
+        .map_err(|e| ServiceError::Validation(e.to_string()))?;
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+    state
+        .ipfs_service
+        .download_file(&inner.cid, &inner.output_path, user_id)
+        .await?;
+    Ok(HttpResponse::Ok().body("File downloaded successfully"))
+}
+
+/// Handles file deletion requests
+/// POST /api/delete
+async fn delete(
+    state: web::Data<super::AppState>,
+    req: web::Json<DeleteRequest>,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let inner = req.into_inner();
+    inner
+        .validate()
+        .map_err(|e| ServiceError::Validation(e.to_string()))?;
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+    state.ipfs_service.delete_file(&inner.cid, user_id).await?;
+    Ok(HttpResponse::Ok().body("File deleted successfully"))
+}
+
+/// Lists all pinned files for the authenticated user
+/// GET /api/pins
+async fn list_pins(
+    state: web::Data<super::AppState>,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+    let pins = state.ipfs_service.list_pins(user_id).await?;
+    Ok(HttpResponse::Ok().json(pins))
+}
+
+/// Retrieves metadata for a specific file
+/// GET /api/metadata/{cid}
+async fn get_metadata(
+    state: web::Data<super::AppState>,
+    path: web::Path<String>,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+    let cid = path.into_inner();
+    let metadata = state
+        .ipfs_service
+        .get_file_metadata(&cid)
+        .await?
+        .ok_or(ServiceError::InvalidInput("File not found".to_string()))?;
+
+    if metadata.user_id != user_id {
+        return Err(ServiceError::Auth("Not authorized to access this file".to_string()).into());
+    }
+
+    Ok(HttpResponse::Ok().json(metadata))
+}
+
+/// Verifies JWT token from request headers
+async fn verify_token(req: HttpRequest, service: &IPFSService) -> Result<i32, ServiceError> {
+    let auth_header = req
+        .headers()
+        .get("Authorization")
+        .ok_or(ServiceError::Auth(
+            "Missing authorization header".to_string(),
+        ))?
+        .to_str()
+        .map_err(|_| ServiceError::Auth("Invalid header format".to_string()))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or(ServiceError::Auth("Invalid token format".to_string()))?;
+
+    let token_data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(service.jwt_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| ServiceError::Auth("Invalid token".to_string()))?;
+
+    Ok(token_data
+        .claims
+        .sub
+        .parse::<i32>()
+        .map_err(|_| ServiceError::Internal)?)
+}
