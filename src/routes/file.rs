@@ -1,6 +1,8 @@
 use crate::models::auth::Claims;
 use crate::{errors::ServiceError, models::requests::*, services::ipfs_service::IPFSService};
+use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
+use futures_util::TryStreamExt;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use validator::Validate;
 
@@ -12,23 +14,36 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .route("/metadata/{cid}", web::get().to(get_metadata));
 }
 
-/// Handles file upload requests
+/// Handles file upload requests via multipart form data
 /// POST /api/upload
 async fn upload(
     state: web::Data<super::AppState>,
-    req: web::Json<UploadRequest>,
+    mut payload: Multipart,
     http_req: HttpRequest,
 ) -> Result<HttpResponse, actix_web::error::Error> {
-    let inner = req.into_inner();
-    inner
-        .validate()
-        .map_err(|e| ServiceError::Validation(e.to_string()))?;
     let user_id = verify_token(http_req, &state.ipfs_service).await?;
-    let metadata = state
-        .ipfs_service
-        .upload_file(&inner.file_path, user_id)
-        .await?;
-    Ok(HttpResponse::Ok().json(metadata))
+
+    // Process the multipart stream
+    while let Some(mut field) = payload.try_next().await? {
+        let file_name = field
+            .content_disposition()
+            .and_then(|cd| cd.get_filename())
+            .map_or("unnamed_file".to_string(), |n| n.to_string());
+
+        // Collect file contents into a Vec<u8>
+        let mut file_contents = Vec::new();
+        while let Some(chunk) = field.try_next().await? {
+            file_contents.extend_from_slice(&chunk);
+        }
+
+        let metadata = state
+            .ipfs_service
+            .upload_file(file_contents, file_name, user_id)
+            .await?;
+        return Ok(HttpResponse::Ok().json(metadata));
+    }
+
+    Err(ServiceError::InvalidInput("No file provided in multipart data".to_string()).into())
 }
 
 /// Handles file download requests

@@ -2,16 +2,6 @@ use serde::Deserialize;
 use validator::{Validate, ValidationError};
 
 /// Request structure for user signup
-///
-/// # Examples
-///
-/// ```rust
-/// let request = SignupRequest {
-///     username: "publiish".to_string(),
-///     email: "publiish@example.com".to_string(),
-///     password: "Passw0rd123!".to_string(),
-/// };
-/// ```
 #[derive(Debug, Validate, Deserialize)]
 pub struct SignupRequest {
     #[validate(length(min = 3, max = 50))]
@@ -24,15 +14,6 @@ pub struct SignupRequest {
 }
 
 /// Request structure for user signin
-///
-/// # Examples
-///
-/// ```rust
-/// let request = SigninRequest {
-///     email: "publiish@example.com".to_string(),
-///     password: "Passw0rd123!".to_string(),
-/// };
-/// ```
 #[derive(Debug, Validate, Deserialize)]
 pub struct SigninRequest {
     #[validate(email)]
@@ -52,13 +33,6 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
         ));
     }
     Ok(())
-}
-
-/// Request structure for uploading files
-#[derive(Debug, Validate, Deserialize)]
-pub struct UploadRequest {
-    #[validate(length(min = 1, max = 255))]
-    pub file_path: String,
 }
 
 /// Request structure for downloading files
