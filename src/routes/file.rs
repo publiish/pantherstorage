@@ -2,9 +2,10 @@ use crate::models::auth::Claims;
 use crate::{errors::ServiceError, models::requests::*, services::ipfs_service::IPFSService};
 use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use mime_guess::from_path;
+use sanitize_filename::sanitize;
 use validator::Validate;
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
@@ -26,22 +27,36 @@ async fn upload(
 
     // Process the multipart stream
     while let Some(mut field) = payload.try_next().await? {
-        let file_name = field
-            .content_disposition()
+        let content_disposition = field.content_disposition();
+        let file_name = content_disposition
             .and_then(|cd| cd.get_filename())
-            .map_or("unnamed_file".to_string(), |n| n.to_string());
+            .map_or("unnamed_file".to_string(), |n| sanitize(n));
 
-        // Collect file contents into a Vec<u8>
-        let mut file_contents = Vec::new();
-        while let Some(chunk) = field.try_next().await? {
-            file_contents.extend_from_slice(&chunk);
+        // Buffer the entire file into memory to avoid Send issues
+        let mut file_bytes = Vec::new();
+        while let Some(chunk) = field.next().await {
+            file_bytes.extend(chunk?);
         }
+
+        if file_bytes.is_empty() {
+            return Err(ServiceError::InvalidInput("Empty file uploaded".to_string()).into());
+        }
+
+        // Create a stream from the buffered bytes
+        let file_stream = futures::stream::iter(vec![Ok(file_bytes)]);
 
         let metadata = state
             .ipfs_service
-            .upload_file(file_contents, file_name, user_id)
-            .await?;
-        return Ok(HttpResponse::Ok().json(metadata));
+            .upload_file(file_stream, file_name.clone(), user_id)
+            .await
+            .map_err(|e| {
+                log::error!("Upload failed for user {}: {}", user_id, e);
+                actix_web::error::ErrorInternalServerError(e)
+            })?;
+
+        return Ok(HttpResponse::Ok()
+            .append_header(("X-CID", metadata.cid.clone()))
+            .json(metadata));
     }
 
     Err(ServiceError::InvalidInput("No file provided in multipart data".to_string()).into())
@@ -61,7 +76,11 @@ async fn download(
         .ipfs_service
         .get_file_metadata(&cid)
         .await?
-        .ok_or(ServiceError::InvalidInput("File not found".to_string()))?;
+        .ok_or_else(|| ServiceError::InvalidInput("File not found".to_string()))?;
+
+    if metadata.user_id != user_id {
+        return Err(ServiceError::Auth("Not authorized to access this file".to_string()).into());
+    }
 
     let file_bytes = state.ipfs_service.fetch_file_bytes(&cid, user_id).await?;
 
@@ -148,9 +167,9 @@ async fn verify_token(req: HttpRequest, service: &IPFSService) -> Result<i32, Se
     )
     .map_err(|_| ServiceError::Auth("Invalid token".to_string()))?;
 
-    Ok(token_data
+    token_data
         .claims
         .sub
         .parse::<i32>()
-        .map_err(|_| ServiceError::Internal)?)
+        .map_err(|_| ServiceError::Internal("Failed to parse user ID".to_string()))
 }
