@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-actix-web = "4.4"
+actix-web = { version = "4.4", features = ["macros"] }
 actix-rt = "2.10.0"
 actix-multipart = "0.7.2"
 actix-service = "2.0.3"
