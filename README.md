@@ -138,7 +138,7 @@ This document provides an overview of the available API endpoints, their expecte
 - **POST** `/api/signup` - Register a new user
 - **POST** `/api/signin` - Authenticate a user and get a JWT
 - **POST** `/api/upload` - Upload a file (requires authentication)
-- **POST** `/api/download` - Download a file (requires authentication)
+- **GET** `/api/download` - Download a file (requires authentication)
 - **POST** `/api/delete` - Delete a file (requires authentication)
 - **GET** `/api/pins` - List pinned files (requires authentication)
 - **GET** `/api/metadata/{cid}` - Get file metadata (requires authentication)
@@ -235,14 +235,14 @@ This document provides an overview of the available API endpoints, their expecte
 ### 4. Download File
 
 - **Description:** Downloads a file buffer stream from IPFS.
-- **Method:** POST
+- **Method:** GET
 - **Endpoint:** `/api/download`
 - **Response:** File fetched by user.
 
 - **Curl Command:**
 
   ```bash
-  curl -X POST http://localhost:8081/api/download/QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o \
+  curl -X GET http://localhost:8081/api/download/QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o \
   -H "Authorization: Bearer <JWT_TOKEN>" \
   -o testfile
   ```
