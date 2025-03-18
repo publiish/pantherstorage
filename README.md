@@ -38,6 +38,7 @@ Provide public file access via an IPFS gateway.
 
 ```bash
 sudo apt update
+sudo apt install docker.io
 sudo apt install -y docker-compose
 ```
 
@@ -127,6 +128,65 @@ This lists all peers in the cluster. For a multi node setup, ensure all expected
 
 ```bash
 docker-compose up -d --build
+```
+
+## Actix Web API with IPFS Integration
+
+This is an Actix Web-based API that integrates with an IPFS service for file storage and retrieval. The application includes middleware, rate limiting, logging, and configuration management.
+
+### Prerequisites
+
+Ensure you have the following installed:
+- [Rust](https://www.rust-lang.org/) (latest stable version)
+- [Cargo](https://doc.rust-lang.org/cargo/) (comes with Rust)
+- [IPFS Daemon](https://docs.ipfs.tech/) (if interacting with a local IPFS node and not using docker-compose file services, install IPFS manually or via a package manager like `brew` on macOS, `apt` on Ubuntu, or `choco` on Windows)
+
+### Installation
+
+Clone the repository:
+```sh
+git clone https://github.com/surajk-m/publiish-api
+cd publiish-api
+```
+
+Install Rust if not already installed:
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+Verify installation:
+```sh
+rustc --version
+cargo --version
+```
+
+### Running the Application
+
+Set up environment variables (example in `.env` file):
+```sh
+DATABASE_URL=mysql://root:password@localhost:3306/publiish_local
+IPFS_NODE=http://127.0.0.1:5001
+BIND_ADDRESS=127.0.0.1:8081
+JWT_SECRET=e03982f1254997738bb3cb3c053d0ec266e6fd1fb22aa2622470ea31f4a27f5e
+RUST_LOG=info
+```
+
+Run the application:
+```sh
+cargo run
+```
+
+### Building and Running in Production
+
+To build the application for production:
+```sh
+cargo build --release
+```
+
+Run the built binary:
+```sh
+./target/release/publiish-api
 ```
 
 ## API Documentation
