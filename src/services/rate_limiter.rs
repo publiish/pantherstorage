@@ -33,7 +33,10 @@ impl RateLimiter {
     }
 
     pub fn check_rate_limit(&self, ip: &str) -> Result<(), ServiceError> {
-        let mut requests = self.requests.lock().map_err(|_| ServiceError::Internal)?;
+        let mut requests = self
+            .requests
+            .lock()
+            .map_err(|e| ServiceError::Internal(format!("Mutex lock failed: {}", e)))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

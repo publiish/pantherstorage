@@ -1,6 +1,7 @@
 use actix_web::{http::StatusCode, HttpResponse};
 use hyper::http::uri::InvalidUri;
 use serde::Serialize;
+use std::sync::PoisonError;
 use thiserror::Error;
 
 /// Possible errors that can occur in the service
@@ -18,8 +19,8 @@ pub enum ServiceError {
     UrlError(#[from] mysql_async::UrlError),
     #[error("Invalid input: {0}")]
     InvalidInput(String),
-    #[error("Internal server error")]
-    Internal,
+    #[error("Internal server error: {0}")]
+    Internal(String),
     #[error("Authentication error: {0}")]
     Auth(String),
     #[error("Validation error: {0}")]
@@ -40,14 +41,46 @@ impl actix_web::error::ResponseError for ServiceError {
 
     fn error_response(&self) -> HttpResponse {
         HttpResponse::build(self.status_code()).json(ErrorResponse {
-            error: self.status_code().to_string(),
+            error: self.status_code().as_str().to_string(),
             message: self.to_string(),
         })
     }
 }
 
+// From implementations for completeness
+impl From<bcrypt::BcryptError> for ServiceError {
+    fn from(err: bcrypt::BcryptError) -> Self {
+        ServiceError::Internal(format!("Password hashing error: {}", err))
+    }
+}
+
+impl From<jsonwebtoken::errors::Error> for ServiceError {
+    fn from(err: jsonwebtoken::errors::Error) -> Self {
+        ServiceError::Internal(format!("JWT error: {}", err))
+    }
+}
+
+impl From<validator::ValidationErrors> for ServiceError {
+    fn from(err: validator::ValidationErrors) -> Self {
+        ServiceError::Validation(err.to_string())
+    }
+}
+
+impl From<actix_multipart::MultipartError> for ServiceError {
+    fn from(err: actix_multipart::MultipartError) -> Self {
+        ServiceError::Internal(format!("Multipart error: {}", err))
+    }
+}
+
+// Handle mutex poisoning
+impl<T> From<PoisonError<T>> for ServiceError {
+    fn from(err: PoisonError<T>) -> Self {
+        ServiceError::Internal(format!("Mutex lock failed: {}", err))
+    }
+}
+
 /// Error response for API endpoints
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     error: String,
     message: String,
