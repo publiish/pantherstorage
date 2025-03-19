@@ -10,15 +10,65 @@ use validator::Validate;
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/upload", web::post().to(upload))
+        .route("/upload_file", web::post().to(upload_file))
         .route("/download/{cid}", web::get().to(download))
         .route("/delete", web::post().to(delete))
         .route("/pins", web::get().to(list_pins))
-        .route("/metadata/{cid}", web::get().to(get_metadata));
+        .route("/metadata/{cid}", web::get().to(get_metadata))
+        .route(
+            "/upload_file/status/{task_id}",
+            web::get().to(get_upload_status_handler),
+        );
 }
 
 /// Handles file upload requests via multipart form data
 /// POST /api/upload
 async fn upload(
+    state: web::Data<super::AppState>,
+    mut payload: Multipart,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+
+    // Process the multipart stream
+    while let Some(mut field) = payload.try_next().await? {
+        let content_disposition = field.content_disposition();
+        let file_name = content_disposition
+            .and_then(|cd| cd.get_filename())
+            .map_or("unnamed_file".to_string(), |n| sanitize(n));
+
+        // Buffer the entire file into memory to avoid Send issues
+        let mut file_bytes = Vec::new();
+        while let Some(chunk) = field.next().await {
+            file_bytes.extend(chunk?);
+        }
+
+        if file_bytes.is_empty() {
+            return Err(ServiceError::InvalidInput("Empty file uploaded".to_string()).into());
+        }
+
+        // Create a stream from the buffered bytes
+        let file_stream = futures::stream::iter(vec![Ok(file_bytes)]);
+
+        let metadata = state
+            .ipfs_service
+            .upload(file_stream, file_name.clone(), user_id)
+            .await
+            .map_err(|e| {
+                log::error!("Upload failed for user {}: {}", user_id, e);
+                actix_web::error::ErrorInternalServerError(e)
+            })?;
+
+        return Ok(HttpResponse::Ok()
+            .append_header(("X-CID", metadata.cid.clone()))
+            .json(metadata));
+    }
+
+    Err(ServiceError::InvalidInput("No file provided in multipart data".to_string()).into())
+}
+
+/// POST /api/upload_file
+async fn upload_file(
     state: web::Data<super::AppState>,
     mut payload: Multipart,
     http_req: HttpRequest,
@@ -55,11 +105,33 @@ async fn upload(
             })?;
 
         return Ok(HttpResponse::Ok()
-            .append_header(("X-CID", metadata.cid.clone()))
+            .append_header(("X-CID", metadata.cid.clone().unwrap_or_default()))
             .json(metadata));
     }
 
     Err(ServiceError::InvalidInput("No file provided in multipart data".to_string()).into())
+}
+
+/// Handles requests to get the status of an upload task
+/// GET /api/upload_file/status/{task_id}
+async fn get_upload_status_handler(
+    state: web::Data<super::AppState>,
+    path: web::Path<String>,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let task_id = path.into_inner();
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+
+    let status = state
+        .ipfs_service
+        .get_upload_status(&task_id, user_id)
+        .await
+        .map_err(|e| {
+            log::error!("Failed to get upload status for task {}: {}", task_id, e);
+            actix_web::error::ErrorInternalServerError(e)
+        })?;
+
+    Ok(HttpResponse::Ok().json(status))
 }
 
 /// Serves file content directly to the browser
