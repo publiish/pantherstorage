@@ -837,10 +837,9 @@ impl IPFSService {
 
     /// Deletes a file from IPFS and removes its metadata
     pub async fn delete_file(&self, cid: &str, user_id: i32) -> Result<(), ServiceError> {
-        let metadata = self
-            .get_file_metadata(cid)
-            .await?
-            .ok_or(ServiceError::InvalidInput("File not found".to_string()))?;
+        let metadata = self.get_file_metadata(cid).await?.ok_or_else(|| {
+            ServiceError::InvalidInput(format!("File with CID {} not found", cid))
+        })?;
 
         if metadata.user_id != user_id {
             return Err(ServiceError::Auth(
@@ -848,18 +847,63 @@ impl IPFSService {
             ));
         }
 
-        self.client
-            .pin_rm(cid, true)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to remove pin: {}", e)))?;
         let mut conn = self.db_pool.get_conn().await?;
-        conn.exec_drop(
-            "DELETE FROM file_metadata WHERE cid = :cid",
-            params! { "cid" => cid },
-        )
-        .await?;
+        let mut tx = conn
+            .start_transaction(mysql_async::TxOpts::default())
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to start transaction: {}", e)))?;
 
-        info!("File deleted by user {}: {}", user_id, cid);
+        tx.exec_drop(
+            "DELETE FROM file_metadata WHERE cid = :cid AND user_id = :user_id",
+            params! { "cid" => cid, "user_id" => user_id },
+        )
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to delete metadata: {}", e)))?;
+
+        let affected_rows = tx.affected_rows();
+
+        if affected_rows == 0 {
+            return Err(ServiceError::Internal(
+                "Failed to delete metadata: no rows affected".to_string(),
+            ));
+        }
+
+        match self.client.pin_rm(cid, true).await {
+            Ok(_) => {
+                info!("Successfully unpinned CID {} for user {}", cid, user_id);
+            }
+            Err(e) => {
+                // Handle the "not pinned" error gracefully
+                if e.to_string().contains("not pinned or pinned indirectly") {
+                    info!(
+                        "CID {} was not pinned or pinned indirectly; proceeding with deletion for user {}",
+                        cid, user_id
+                    );
+                } else {
+                    tx.rollback().await.map_err(|e| {
+                        ServiceError::Internal(format!("Failed to rollback transaction: {}", e))
+                    })?;
+                    return Err(ServiceError::Internal(format!(
+                        "Failed to remove pin for CID {}: {}",
+                        cid, e
+                    )));
+                }
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to commit transaction: {}", e)))?;
+
+        info!("File deleted successfully by user {}: CID {}", user_id, cid);
+
+        // Note: Garbage collection (`repo_gc`) is not directly supported by `ipfs_api`.
+        // If needed, we need to implement a custom HTTP call to the IPFS API endpoint `/repo/gc`.
+        log::info!(
+            "Skipping garbage collection for CID {}",
+            cid
+        );
+
         Ok(())
     }
 
