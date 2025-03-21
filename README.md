@@ -24,17 +24,40 @@ Provide public file access via an IPFS gateway.
 - **First Node:** Generates new swarm and cluster keys; no bootstrap nodes required.
 - **Subsequent Nodes:** Reuse existing keys and connect to the first node as the bootstrap.
 
+### SWARM_KEY - How to Generate?
+The `SWARM_KEY` is a private key used by IPFS to create a private network, ensuring that only nodes with the same key can connect to each other. It restricts the IPFS swarm to a specific set of peers, isolating it from the public IPFS network.
+
+The SWARM_KEY is a 32-byte (64-character hexadecimal) key prefixed with a specific header. Here’s how to generate it: 
+
+**On Linux/macOS (using /dev/urandom)**
+
+```bash
+echo $(od -vN 32 -An -tx1 /dev/urandom | tr -d ' \n')
+```
+
+```
+echo "/key/swarm/psk/1.0.0/" > swarm.key
+echo "/base16/" >> swarm.key
+tr -dc 'a-f0-9' < /dev/urandom | head -c64 >> swarm.key
+```
+
+**On Windows (using PowerShell)**
+```
+$key = -join ((0..9) + ('a'..'f') | Get-Random -Count 64)
+"/key/swarm/psk/1.0.0/`n/base16/`n$key" | Out-File -FilePath swarm.key
+```
+
 ### Prerequisites
 
 - **Operating System:** Ubuntu (or any Debian-based Linux OS).
 - **Docker:** Install with docker-compose for container management.
 - **User Permissions:** Ensure your user has Docker access.
 
-### Installation
+### Basic Installation for Different Operating System
 
-### 1. Install Docker and Docker Compose
+### 1. Linux (Ubuntu/Debian)
 
-#### Install Docker Compose:
+#### Install Docker and Docker Compose:
 
 ```bash
 sudo apt update
@@ -51,6 +74,16 @@ sudo usermod -a -G docker $USER
 #### Apply Changes:
 Restart your terminal or log out and back in to refresh group permissions.
 
+### 2. macOS - Ensure the user has appropriate permissions to run Docker commands
+
+#### Install Docker and Docker Compose:
+
+```bash
+brew install docker docker-compose
+```
+
+### 3. Windows - Install Docker Desktop from the official site and enable WSL2
+
 ### Configuration
 
 ### IPFS Node: Swarm Key
@@ -59,7 +92,7 @@ The swarm key ensures your IPFS nodes operate in a private network.
 Add this to `docker-compose.yml` under the `SWARM_KEY` environment variable.
 
 ### IPFS Cluster Node: Cluster Secret
-The cluster secret secures your IPFS Cluster network.
+The cluster secret is a 32-byte (64-character hexadecimal) key used by IPFS-Cluster to secure communication between cluster peers. It ensures that only nodes with the same secret can participate in the cluster, providing authentication and encryption for cluster operations like pinning and replication.
 
 #### For the First Node:
 Generate a new cluster secret (another 32-byte hex string):
@@ -155,6 +188,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
 
+### Rustc compiled version
+```
+rustc 1.84.1 (e71f9a9a9 2025-01-27)
+```
+
 Verify installation:
 ```sh
 rustc --version
@@ -198,10 +236,11 @@ This document provides an overview of the available API endpoints, their expecte
 - **POST** `/api/signup` - Register a new user
 - **POST** `/api/signin` - Authenticate a user and get a JWT
 - **POST** `/api/upload` - Upload a file (requires authentication)
-- **GET** `/api/download` - Download a file (requires authentication)
-- **POST** `/api/delete` - Delete a file (requires authentication)
+- **POST** `/api/delete` - Unpin a file (requires authentication)
 - **GET** `/api/pins` - List pinned files (requires authentication)
+- **GET** `/api/download/{cid}` - Download a file (requires authentication)
 - **GET** `/api/metadata/{cid}` - Get file metadata (requires authentication)
+- **GET** `/api/upload/status/{task_id}` - Get upload task status (requires authentication)
 
 ### API Usage Examples
 
@@ -268,10 +307,13 @@ This document provides an overview of the available API endpoints, their expecte
 
 ### 3. Upload File
 
-- **Description:** Uploads a file to IPFS and stores its metadata.
+- **Description:** Uploads a file and stores its metadata. Supports synchronous and asynchronous modes.
 - **Method:** POST
 - **Endpoint:** `/api/upload`
-- **Response:**
+- **Query Parameter**: async=true (optional, for asynchronous upload)
+- **Request Body:** Multipart form data with a file field containing the file content.
+
+- **Response(Synchronous):**
 
   ```json
   {
@@ -283,21 +325,45 @@ This document provides an overview of the available API endpoints, their expecte
   }
   ```
 
-- **Curl Command:**
+- **Response(Asynchronous):**
+
+  ```json
+  {
+    "task_id": "c21fc79c-44e4-4d87-9321-1adf6a4fc1df",
+    "status": "pending",
+    "cid": null,
+    "error": null,
+    "progress": 0.0,
+    "started_at": "2025-03-21 10:00:00.123456 UTC"
+  }
+  ```
+
+- **Curl Command (Synchronous):**
 
   ```bash
   curl -X POST http://0.0.0.0:8081/api/upload \
   -H "Content-Type: multipart/form-data" \
   -H "Authorization: Bearer <JWT_TOKEN>" \
-  -F "file=@/home/s5k/example.txt"
+  -F "file=@/path/to/example.txt"
+  ```
+
+- **Curl Command (Asynchronous):**
+
+  ```bash
+  curl -X POST http://0.0.0.0:8081/api/upload?async=true \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@/path/to/example.txt"
   ```
 
 ### 4. Download File
 
 - **Description:** Downloads a file buffer stream from IPFS.
 - **Method:** GET
-- **Endpoint:** `/api/download`
-- **Response:** File fetched by user.
+- **Endpoint:** `/api/download/{cid}`
+- **Request Headers:** Authorization: Bearer <JWT_TOKEN>
+- **Response:** File fetched by user. Binary file content with appropriate `Content-Type` and `Content-Disposition` headers.
+- **Notes:** The `Content-Type` is inferred from the file extension, defaulting to `application/octet-stream`.
 
 - **Curl Command:**
 
@@ -370,5 +436,30 @@ This document provides an overview of the available API endpoints, their expecte
 
   ```bash
   curl -X GET http://0.0.0.0:8081/api/metadata/QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o \
+  -H "Authorization: Bearer <JWT_TOKEN>"
+  ```
+
+### 8. Get Upload Status
+
+- **Description:** Retrieves the status of an asynchronous upload task.
+- **Method:** GET
+- **Endpoint:** `/api/upload/status/{task_id}`
+- **Response:**
+
+  ```json
+  {
+    "task_id": "c21fc79c-44e4-4d87-9321-1adf6a4fc1df",
+    "status": "completed",
+    "cid": "QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o",
+    "error": null,
+    "progress": 100.0,
+    "started_at": "2025-03-21 10:00:00.123456 UTC"
+  }
+  ```
+
+- **Curl Command:**
+
+  ```bash
+  curl -X GET http://0.0.0.0:8081/api/upload/status/c21fc79c-44e4-4d87-9321-1adf6a4fc1df \
   -H "Authorization: Bearer <JWT_TOKEN>"
   ```
