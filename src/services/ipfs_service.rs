@@ -758,23 +758,58 @@ impl IPFSService {
         }
     }
 
-    // @TODO: Cleanup old tasks (could be run periodically)
-    #[allow(dead_code)]
+    /// Cleans up old upload tasks from memory and database that are older than 2 hours
+    /// and have a status of 'completed' or 'failed'. This should be run periodically.
     pub async fn cleanup_old_tasks(&self) -> Result<(), ServiceError> {
-        let mut tasks = self.tasks.write().await;
-        tasks.retain(|_, info| {
-            // Let's keep 24 hours for now
-            info.status.started_at.timestamp() > (Utc::now().timestamp() - 24 * 3600)
-        });
+        let cutoff_time = Utc::now() - Duration::hours(2);
+        info!("Starting cleanup of tasks older than {}", cutoff_time);
 
-        let mut conn = self.db_pool.get_conn().await?;
-        conn.exec_drop(
-            r"DELETE FROM upload_tasks 
-              WHERE started_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) 
-              AND status IN ('completed', 'failed')",
-            (),
-        )
-        .await?;
+        // Clean up in-memory tasks
+        {
+            let mut tasks = self.tasks.write().await;
+            let initial_count = tasks.len();
+            tasks.retain(|task_id, info| {
+                let keep = info.status.started_at > cutoff_time
+                    || (info.status.status != "completed" && info.status.status != "failed");
+                if !keep {
+                    info!(
+                        "Removing in-memory task {} started at {}",
+                        task_id, info.status.started_at
+                    );
+                }
+                keep
+            });
+            let removed_count = initial_count - tasks.len();
+            info!("Removed {} old tasks from in-memory cache", removed_count);
+        }
+
+        // Clean up database tasks
+        let mut conn = self.db_pool.get_conn().await.map_err(|e| {
+            ServiceError::Internal(format!("Failed to get database connection: {}", e))
+        })?;
+
+        let cutoff_str = cutoff_time.format("%Y-%m-%d %H:%M:%S").to_string();
+        let _affected_rows = conn
+            .exec_drop(
+                r"DELETE FROM upload_tasks 
+                  WHERE started_at < :cutoff 
+                  AND status IN ('completed', 'failed')",
+                params! { "cutoff" => &cutoff_str },
+            )
+            .await
+            .map_err(|e| {
+                ServiceError::Internal(format!("Failed to delete old tasks from database: {}", e))
+            })?;
+
+        let affected_rows_count = conn.affected_rows();
+        if affected_rows_count > 0 {
+            info!(
+                "Removed {} old tasks from upload_tasks table",
+                affected_rows_count
+            );
+        } else {
+            info!("No old tasks found in database to remove");
+        }
 
         Ok(())
     }
@@ -899,10 +934,7 @@ impl IPFSService {
 
         // Note: Garbage collection (`repo_gc`) is not directly supported by `ipfs_api`.
         // If needed, we need to implement a custom HTTP call to the IPFS API endpoint `/repo/gc`.
-        log::info!(
-            "Skipping garbage collection for CID {}",
-            cid
-        );
+        log::info!("Skipping garbage collection for CID {}", cid);
 
         Ok(())
     }
