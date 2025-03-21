@@ -36,7 +36,7 @@ pub fn validate_password(password: &str) -> Result<(), ValidationError> {
 }
 
 /// Request structure for deleting files
-#[derive(Debug, Validate, Deserialize)]
+#[derive(Validate, Deserialize)]
 pub struct DeleteRequest {
     #[validate(length(min = 1))]
     pub cid: String,

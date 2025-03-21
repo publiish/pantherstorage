@@ -2,10 +2,11 @@ use crate::models::auth::Claims;
 use crate::{errors::ServiceError, models::requests::*, services::ipfs_service::IPFSService};
 use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use mime_guess::from_path;
 use sanitize_filename::sanitize;
+use std::collections::HashMap;
 use validator::Validate;
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
@@ -13,53 +14,85 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .route("/download/{cid}", web::get().to(download))
         .route("/delete", web::post().to(delete))
         .route("/pins", web::get().to(list_pins))
-        .route("/metadata/{cid}", web::get().to(get_metadata));
+        .route("/metadata/{cid}", web::get().to(get_metadata))
+        .route(
+            "/upload/status/{task_id}",
+            web::get().to(get_upload_status_handler),
+        );
 }
 
 /// Handles file upload requests via multipart form data
-/// POST /api/upload
+/// POST /api/upload?async=true (optional query param for async behavior)
 async fn upload(
     state: web::Data<super::AppState>,
     mut payload: Multipart,
     http_req: HttpRequest,
+    query: web::Query<HashMap<String, String>>,
 ) -> Result<HttpResponse, actix_web::error::Error> {
     let user_id = verify_token(http_req, &state.ipfs_service).await?;
+    let is_async = query.get("async").map_or(false, |v| v == "true");
+
+    let mut file_bytes = Vec::new();
+    let mut file_name = "unnamed_file".to_string();
 
     // Process the multipart stream
-    while let Some(mut field) = payload.try_next().await? {
-        let content_disposition = field.content_disposition();
-        let file_name = content_disposition
-            .and_then(|cd| cd.get_filename())
-            .map_or("unnamed_file".to_string(), |n| sanitize(n));
-
-        // Buffer the entire file into memory to avoid Send issues
-        let mut file_bytes = Vec::new();
+    while let Some(field) = payload.next().await {
+        let mut field = field?;
+        if let Some(content_disposition) = field.content_disposition() {
+            if let Some(name) = content_disposition.get_filename() {
+                file_name = sanitize(name);
+            }
+        }
         while let Some(chunk) = field.next().await {
             file_bytes.extend(chunk?);
         }
-
-        if file_bytes.is_empty() {
-            return Err(ServiceError::InvalidInput("Empty file uploaded".to_string()).into());
-        }
-
-        // Create a stream from the buffered bytes
-        let file_stream = futures::stream::iter(vec![Ok(file_bytes)]);
-
-        let metadata = state
-            .ipfs_service
-            .upload_file(file_stream, file_name.clone(), user_id)
-            .await
-            .map_err(|e| {
-                log::error!("Upload failed for user {}: {}", user_id, e);
-                actix_web::error::ErrorInternalServerError(e)
-            })?;
-
-        return Ok(HttpResponse::Ok()
-            .append_header(("X-CID", metadata.cid.clone()))
-            .json(metadata));
     }
 
-    Err(ServiceError::InvalidInput("No file provided in multipart data".to_string()).into())
+    if file_bytes.is_empty() {
+        return Err(ServiceError::InvalidInput("Empty file uploaded".to_string()).into());
+    }
+
+    let file_stream = futures::stream::iter(vec![Ok(file_bytes)]);
+
+    if is_async {
+        // Asynchronous upload
+        let status = state
+            .ipfs_service
+            .upload_file(file_stream, file_name, user_id)
+            .await?;
+        Ok(HttpResponse::Ok().json(status))
+    } else {
+        // Synchronous upload
+        let metadata = state
+            .ipfs_service
+            .upload(file_stream, file_name, user_id)
+            .await?;
+        Ok(HttpResponse::Ok()
+            .append_header(("X-CID", metadata.cid.clone()))
+            .json(metadata))
+    }
+}
+
+/// Handles requests to get the status of an upload task
+/// GET /api/upload_file/status/{task_id}
+async fn get_upload_status_handler(
+    state: web::Data<super::AppState>,
+    path: web::Path<String>,
+    http_req: HttpRequest,
+) -> Result<HttpResponse, actix_web::error::Error> {
+    let task_id = path.into_inner();
+    let user_id = verify_token(http_req, &state.ipfs_service).await?;
+
+    let status = state
+        .ipfs_service
+        .get_upload_status(&task_id, user_id)
+        .await
+        .map_err(|e| {
+            log::error!("Failed to get upload status for task {}: {}", task_id, e);
+            actix_web::error::ErrorInternalServerError(e)
+        })?;
+
+    Ok(HttpResponse::Ok().json(status))
 }
 
 /// Serves file content directly to the browser
@@ -107,9 +140,31 @@ async fn delete(
     inner
         .validate()
         .map_err(|e| ServiceError::Validation(e.to_string()))?;
+
     let user_id = verify_token(http_req, &state.ipfs_service).await?;
-    state.ipfs_service.delete_file(&inner.cid, user_id).await?;
-    Ok(HttpResponse::Ok().body("File deleted successfully"))
+
+    state
+        .ipfs_service
+        .delete_file(&inner.cid, user_id)
+        .await
+        .map_err(|e| {
+            log::error!(
+                "Failed to delete file CID {} for user {}: {}",
+                inner.cid,
+                user_id,
+                e
+            );
+            match e {
+                ServiceError::InvalidInput(_) => actix_web::error::ErrorNotFound(e),
+                ServiceError::Auth(_) => actix_web::error::ErrorForbidden(e),
+                _ => actix_web::error::ErrorInternalServerError(e),
+            }
+        })?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "File deleted successfully",
+        "cid": inner.cid
+    })))
 }
 
 /// Lists all pinned files for the authenticated user
