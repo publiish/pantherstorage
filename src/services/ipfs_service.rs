@@ -18,10 +18,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::oneshot;
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock, Semaphore};
 use uuid::Uuid;
 use validator::Validate;
+
+// Default maximum concurrent uploads
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 42;
 
 /// Service handling IPFS operations and user management
 pub struct IPFSService {
@@ -30,6 +32,8 @@ pub struct IPFSService {
     pub jwt_secret: String,
     // In-memory task tracking
     tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
+    // Cap concurrent uploads
+    operation_semaphore: Arc<Semaphore>,
     #[allow(dead_code)]
     pub url: String,
 }
@@ -340,6 +344,7 @@ impl IPFSService {
             url: config.ipfs_node.clone(),
             jwt_secret: config.jwt_secret.clone(),
             tasks: Arc::new(RwLock::new(HashMap::new())),
+            operation_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_UPLOADS)),
         })
     }
 
@@ -438,6 +443,12 @@ impl IPFSService {
     where
         S: Stream<Item = Result<Vec<u8>, ServiceError>> + Send + Sync + Unpin + 'static,
     {
+        // Acquire a semaphore permit to limit concurrent uploads
+        let _permit =
+            self.operation_semaphore.acquire().await.map_err(|e| {
+                ServiceError::Internal(format!("Failed to acquire semaphore: {}", e))
+            })?;
+
         let (sized_stream, size_tracker) = SizedByteStream::new(file_stream);
 
         let response = self
@@ -565,37 +576,58 @@ impl IPFSService {
         let client = self.client.clone();
         let db_pool = self.db_pool.clone();
         let tasks = self.tasks.clone();
+        let semaphore = self.operation_semaphore.clone();
         let task_id_clone = task_id.clone();
         let file_name_clone = file_name.clone();
 
         tokio::task::spawn_local(async move {
-            let result = Self::process_upload(
-                client,
-                db_pool,
-                file_stream,
-                file_name_clone,
-                user_id,
-                task_id_clone.clone(),
-                tasks.clone(),
-            )
-            .await;
+            // Acquire semaphore permit within the async task
+            match semaphore.acquire().await {
+                Ok(_permit) => {
+                    let result = Self::process_upload(
+                        client,
+                        db_pool,
+                        file_stream,
+                        file_name_clone,
+                        user_id,
+                        task_id_clone.clone(),
+                        tasks.clone(),
+                    )
+                    .await;
 
-            // Update task status
-            let mut tasks = tasks.write().await;
-            if let Some(task_info) = tasks.get_mut(&task_id_clone) {
-                match &result {
-                    Ok(metadata) => {
-                        task_info.status.status = "completed".to_string();
-                        task_info.status.cid = Some(metadata.cid.clone());
-                        task_info.status.progress = Some(100.0);
-                    }
-                    Err(e) => {
-                        task_info.status.status = "failed".to_string();
-                        task_info.status.error = Some(e.to_string());
+                    // Update task status
+                    let mut tasks = tasks.write().await;
+                    if let Some(task_info) = tasks.get_mut(&task_id_clone) {
+                        match &result {
+                            Ok(metadata) => {
+                                task_info.status.status = "completed".to_string();
+                                task_info.status.cid = Some(metadata.cid.clone());
+                                task_info.status.progress = Some(100.0);
+                            }
+                            Err(e) => {
+                                task_info.status.status = "failed".to_string();
+                                task_info.status.error = Some(e.to_string());
+                            }
+                        }
+                        if let Some(tx) = task_info.tx.take() {
+                            let _ = tx.send(result);
+                        }
                     }
                 }
-                if let Some(tx) = task_info.tx.take() {
-                    let _ = tx.send(result);
+                Err(e) => {
+                    // Handle semaphore acquisition failure
+                    let mut tasks = tasks.write().await;
+                    if let Some(task_info) = tasks.get_mut(&task_id_clone) {
+                        task_info.status.status = "failed".to_string();
+                        task_info.status.error =
+                            Some(format!("Failed to acquire semaphore: {}", e));
+                        if let Some(tx) = task_info.tx.take() {
+                            let _ = tx.send(Err(ServiceError::Internal(format!(
+                                "Semaphore acquire failed: {}",
+                                e
+                            ))));
+                        }
+                    }
                 }
             }
         });
