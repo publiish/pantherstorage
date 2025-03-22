@@ -21,9 +21,6 @@ use tokio::sync::{oneshot, RwLock, Semaphore};
 use uuid::Uuid;
 use validator::Validate;
 
-// Default maximum concurrent uploads
-const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 42;
-
 /// Service handling IPFS operations and user management
 pub struct IPFSService {
     pub client: IpfsClient,
@@ -123,7 +120,7 @@ impl IPFSService {
             url: config.ipfs_node.clone(),
             jwt_secret: config.jwt_secret.clone(),
             tasks: Arc::new(RwLock::new(HashMap::new())),
-            operation_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_UPLOADS)),
+            operation_semaphore: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
         })
     }
 
