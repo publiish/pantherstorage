@@ -9,6 +9,7 @@ mod middleware;
 mod models;
 mod routes;
 mod services;
+mod stream;
 
 use config::Config;
 use services::ipfs_service::IPFSService;
