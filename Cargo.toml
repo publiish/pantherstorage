@@ -35,5 +35,4 @@ validator = { version = "0.20.0", features = ["derive"] }
 pqcrypto-kyber = "0.8.1"  
 pqcrypto-dilithium = "0.5.0"
 pqcrypto-traits = "0.3.5"
-bincode = { version = "2.0.1", features = ["derive"] }
 base64 = "0.22.1"

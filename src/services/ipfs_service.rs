@@ -26,7 +26,12 @@ use validator::Validate;
 
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
-use bincode;
+
+#[derive(Serialize, Deserialize)]
+struct TokenHeader {
+    alg: String,
+    typ: String,
+}
 
 /// Service handling IPFS operations and user management
 pub struct IPFSService {
@@ -169,23 +174,38 @@ impl IPFSService {
             .await?
             .ok_or_else(|| ServiceError::Internal("Failed to get user ID".to_string()))?;
 
+        let header = TokenHeader {
+            alg: "Dilithium5".to_string(),
+            typ: "PQC".to_string(),
+        };
+
         let claims = Claims {
             sub: user_id.to_string(),
             exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
             signature: Vec::new(),
         };
 
-        // Serialize claims and sign with Dilithium
-        let claims_bytes = bincode::encode_to_vec(&claims, bincode::config::standard())
-            .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?;
-        let signature = dilithium5::detached_sign(&claims_bytes, &self.signing_key);
-        let mut signed_claims = claims;
-        signed_claims.signature = signature.as_bytes().to_vec();
+        // Serialize header and claims to JSON
+        let header_json = serde_json::to_string(&header)
+            .map_err(|e| ServiceError::Internal(format!("Header serialization failed: {}", e)))?;
+        let payload_json = serde_json::to_string(&claims)
+            .map_err(|e| ServiceError::Internal(format!("Payload serialization failed: {}", e)))?;
 
-        let token = Base64Engine.encode(
-            bincode::encode_to_vec(&signed_claims, bincode::config::standard())
-                .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?,
+        // Base64URL encode header and payload
+        let header_encoded = Base64Engine.encode(header_json);
+        let payload_encoded = Base64Engine.encode(payload_json);
+
+        // Create message to sign: "header.payload"
+        let message = format!("{}.{}", header_encoded, payload_encoded);
+        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
+        let signature_encoded = Base64Engine.encode(signature.as_bytes());
+
+        // Construct token
+        let token = format!(
+            "{}.{}.{}",
+            header_encoded, payload_encoded, signature_encoded
         );
+
         info!("New user signed up: {}", req.email);
         Ok(token)
     }
@@ -209,56 +229,88 @@ impl IPFSService {
             return Err(ServiceError::Auth("Invalid credentials".to_string()));
         }
 
+        let header = TokenHeader {
+            alg: "Dilithium5".to_string(),
+            typ: "PQC".to_string(),
+        };
+
         let claims = Claims {
             sub: user_id.to_string(),
             exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
             signature: Vec::new(),
         };
 
-        let claims_bytes = bincode::encode_to_vec(&claims, bincode::config::standard())
-            .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?;
-        let signature = dilithium5::detached_sign(&claims_bytes, &self.signing_key);
-        println!("Signature size: {}", signature.as_bytes().len());
-        let mut signed_claims = claims;
-        signed_claims.signature = signature.as_bytes().to_vec();
+        let header_json = serde_json::to_string(&header)
+            .map_err(|e| ServiceError::Internal(format!("Header serialization failed: {}", e)))?;
+        let payload_json = serde_json::to_string(&claims)
+            .map_err(|e| ServiceError::Internal(format!("Payload serialization failed: {}", e)))?;
 
-        let token = Base64Engine.encode(
-            bincode::encode_to_vec(&signed_claims, bincode::config::standard())
-                .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?,
+        let header_encoded = Base64Engine.encode(header_json);
+        let payload_encoded = Base64Engine.encode(payload_json);
+
+        let message = format!("{}.{}", header_encoded, payload_encoded);
+        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
+        let signature_encoded = Base64Engine.encode(signature.as_bytes());
+
+        let token = format!(
+            "{}.{}.{}",
+            header_encoded, payload_encoded, signature_encoded
         );
+
         info!("User signed in: {}", req.email);
         Ok(token)
     }
 
     pub fn verify_token(&self, token: &str) -> Result<Claims, ServiceError> {
-        let decoded = Base64Engine
-            .decode(token)
-            .map_err(|e| ServiceError::Auth(format!("Invalid token format: {}", e)))?;
-
-        let (claims, _): (Claims, usize) =
-            bincode::decode_from_slice(&decoded, bincode::config::standard())
-                .map_err(|e| ServiceError::Auth(format!("Failed to deserialize claims: {}", e)))?;
-
-        let signature = DetachedSignature::from_bytes(&claims.signature)
-            .map_err(|e| ServiceError::Auth(format!("Invalid signature format: {}", e)))?;
-        let claims_no_sig = Claims {
-            sub: claims.sub.clone(),
-            exp: claims.exp,
-            signature: Vec::new(),
-        };
-        let claims_bytes = bincode::encode_to_vec(&claims_no_sig, bincode::config::standard())
-            .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?;
-
-        match dilithium5::verify_detached_signature(&signature, &claims_bytes, &self.public_key) {
-            // Signature is valid
-            Ok(()) => (),
-            Err(_) => return Err(ServiceError::Auth("Invalid signature".to_string())),
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(ServiceError::Auth("Invalid token format".to_string()));
         }
 
+        let header_encoded = parts[0];
+        let payload_encoded = parts[1];
+        let signature_encoded = parts[2];
+
+        // Decode header
+        let header_json = Base64Engine
+            .decode(header_encoded)
+            .map_err(|e| ServiceError::Auth(format!("Invalid header encoding: {}", e)))?;
+        let header: TokenHeader = serde_json::from_slice(&header_json)
+            .map_err(|e| ServiceError::Auth(format!("Invalid header: {}", e)))?;
+        if header.alg != "Dilithium5" || header.typ != "PQC" {
+            return Err(ServiceError::Auth(
+                "Unsupported algorithm or type".to_string(),
+            ));
+        }
+
+        // Decode payload
+        let payload_json = Base64Engine
+            .decode(payload_encoded)
+            .map_err(|e| ServiceError::Auth(format!("Invalid payload encoding: {}", e)))?;
+        let mut claims: Claims = serde_json::from_slice(&payload_json)
+            .map_err(|e| ServiceError::Auth(format!("Invalid payload: {}", e)))?;
+
+        // Verify signature
+        let message = format!("{}.{}", header_encoded, payload_encoded);
+        let signature_bytes = Base64Engine
+            .decode(signature_encoded)
+            .map_err(|e| ServiceError::Auth(format!("Invalid signature encoding: {}", e)))?;
+        let signature = DetachedSignature::from_bytes(&signature_bytes)
+            .map_err(|e| ServiceError::Auth(format!("Invalid signature format: {}", e)))?;
+
+        if dilithium5::verify_detached_signature(&signature, message.as_bytes(), &self.public_key)
+            .is_err()
+        {
+            return Err(ServiceError::Auth("Invalid signature".to_string()));
+        }
+
+        // Check expiration
         if claims.exp < Utc::now().timestamp() as usize {
             return Err(ServiceError::Auth("Token expired".to_string()));
         }
 
+        // Clear signature field as it's not needed post-verification
+        claims.signature = Vec::new();
         Ok(claims)
     }
 

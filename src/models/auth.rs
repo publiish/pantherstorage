@@ -1,8 +1,7 @@
-use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 /// PQC Claims for authentication tokens
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
