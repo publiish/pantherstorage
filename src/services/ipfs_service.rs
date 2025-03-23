@@ -16,7 +16,10 @@ use log::error;
 use log::info;
 use mysql_async::{prelude::*, Opts, Pool, Row, Value};
 use pqcrypto_dilithium::dilithium5::{self, PublicKey, SecretKey};
-use pqcrypto_traits::sign::DetachedSignature as DetachedSignatureTrait;
+use pqcrypto_traits::sign::{
+    DetachedSignature as DetachedSignatureTrait, PublicKey as OtherPublicKey,
+    SecretKey as OtherSecretKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -124,8 +127,32 @@ impl IPFSService {
 
         info!("Database schema initialized");
 
-        // Generate Dilithium keypair
-        let (public_key, signing_key) = pqcrypto_dilithium::dilithium5::keypair();
+        // Decode Base64 keys from config
+        let public_key_bytes = Base64Engine
+            .decode(&config.dilithium_public_key)
+            .map_err(|e| ServiceError::Internal(format!("Failed to decode public key: {}", e)))?;
+        let secret_key_bytes = Base64Engine
+            .decode(&config.dilithium_secret_key)
+            .map_err(|e| ServiceError::Internal(format!("Failed to decode secret key: {}", e)))?;
+
+        // Log the Public keys as Base64 strings
+        info!(
+            "Public Key (Base64): {}",
+            Base64Engine.encode(&public_key_bytes)
+        );
+        // Log the SecretKey (! in Production)
+        info!(
+            "Secret Key (Base64): {}",
+            Base64Engine.encode(&secret_key_bytes)
+        );
+
+        // Convert bytes to Dilithium key types
+        let public_key = PublicKey::from_bytes(&public_key_bytes).map_err(|e| {
+            ServiceError::Internal(format!("Invalid Dilithium public key format: {}", e))
+        })?;
+        let signing_key = SecretKey::from_bytes(&secret_key_bytes).map_err(|e| {
+            ServiceError::Internal(format!("Invalid Dilithium secret key format: {}", e))
+        })?;
 
         Ok(Self {
             client,
