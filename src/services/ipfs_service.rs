@@ -15,9 +15,10 @@ use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
 use log::error;
 use log::info;
 use mysql_async::{prelude::*, Opts, Pool, Row, Value};
-use pqcrypto_dilithium::dilithium5::{self, DetachedSignature, PublicKey, SecretKey};
+use pqcrypto_dilithium::dilithium5::{self, PublicKey, SecretKey};
 use pqcrypto_traits::sign::DetachedSignature as DetachedSignatureTrait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock, Semaphore};
@@ -186,11 +187,8 @@ impl IPFSService {
         };
 
         // Serialize header and claims to JSON
-        let header_json = serde_json::to_string(&header)
-            .map_err(|e| ServiceError::Internal(format!("Header serialization failed: {}", e)))?;
-        let payload_json = serde_json::to_string(&claims)
-            .map_err(|e| ServiceError::Internal(format!("Payload serialization failed: {}", e)))?;
-
+        let header_json = serde_json::to_string(&header)?;
+        let payload_json = serde_json::to_string(&claims)?;
         // Base64URL encode header and payload
         let header_encoded = Base64Engine.encode(header_json);
         let payload_encoded = Base64Engine.encode(payload_json);
@@ -198,14 +196,15 @@ impl IPFSService {
         // Create message to sign: "header.payload"
         let message = format!("{}.{}", header_encoded, payload_encoded);
         let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
-        let signature_encoded = Base64Engine.encode(signature.as_bytes());
+
+        let signature_hash = Sha256::digest(signature.as_bytes());
+        let signature_encoded = Base64Engine.encode(&signature_hash);
 
         // Construct token
         let token = format!(
             "{}.{}.{}",
             header_encoded, payload_encoded, signature_encoded
         );
-
         info!("New user signed up: {}", req.email);
         Ok(token)
     }
@@ -240,23 +239,21 @@ impl IPFSService {
             signature: Vec::new(),
         };
 
-        let header_json = serde_json::to_string(&header)
-            .map_err(|e| ServiceError::Internal(format!("Header serialization failed: {}", e)))?;
-        let payload_json = serde_json::to_string(&claims)
-            .map_err(|e| ServiceError::Internal(format!("Payload serialization failed: {}", e)))?;
-
+        let header_json = serde_json::to_string(&header)?;
+        let payload_json = serde_json::to_string(&claims)?;
         let header_encoded = Base64Engine.encode(header_json);
         let payload_encoded = Base64Engine.encode(payload_json);
 
         let message = format!("{}.{}", header_encoded, payload_encoded);
         let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
-        let signature_encoded = Base64Engine.encode(signature.as_bytes());
+
+        let signature_hash = Sha256::digest(signature.as_bytes());
+        let signature_encoded = Base64Engine.encode(&signature_hash);
 
         let token = format!(
             "{}.{}.{}",
             header_encoded, payload_encoded, signature_encoded
         );
-
         info!("User signed in: {}", req.email);
         Ok(token)
     }
@@ -271,45 +268,42 @@ impl IPFSService {
         let payload_encoded = parts[1];
         let signature_encoded = parts[2];
 
-        // Decode header
-        let header_json = Base64Engine
-            .decode(header_encoded)
-            .map_err(|e| ServiceError::Auth(format!("Invalid header encoding: {}", e)))?;
-        let header: TokenHeader = serde_json::from_slice(&header_json)
-            .map_err(|e| ServiceError::Auth(format!("Invalid header: {}", e)))?;
+        let header_json = Base64Engine.decode(header_encoded)?;
+        let header: TokenHeader = serde_json::from_slice(&header_json)?;
         if header.alg != "Dilithium5" || header.typ != "PQC" {
             return Err(ServiceError::Auth(
                 "Unsupported algorithm or type".to_string(),
             ));
         }
 
-        // Decode payload
-        let payload_json = Base64Engine
-            .decode(payload_encoded)
-            .map_err(|e| ServiceError::Auth(format!("Invalid payload encoding: {}", e)))?;
-        let mut claims: Claims = serde_json::from_slice(&payload_json)
-            .map_err(|e| ServiceError::Auth(format!("Invalid payload: {}", e)))?;
+        let payload_json = Base64Engine.decode(payload_encoded)?;
+        let mut claims: Claims = serde_json::from_slice(&payload_json)?;
 
-        // Verify signature
+        let provided_signature_hash = Base64Engine.decode(signature_encoded)?;
+        if provided_signature_hash.len() != 32 {
+            return Err(ServiceError::Auth("Invalid signature length".to_string()));
+        }
+
         let message = format!("{}.{}", header_encoded, payload_encoded);
-        let signature_bytes = Base64Engine
-            .decode(signature_encoded)
-            .map_err(|e| ServiceError::Auth(format!("Invalid signature encoding: {}", e)))?;
-        let signature = DetachedSignature::from_bytes(&signature_bytes)
-            .map_err(|e| ServiceError::Auth(format!("Invalid signature format: {}", e)))?;
+        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
 
         if dilithium5::verify_detached_signature(&signature, message.as_bytes(), &self.public_key)
             .is_err()
         {
-            return Err(ServiceError::Auth("Invalid signature".to_string()));
+            return Err(ServiceError::Auth(
+                "Signature verification failed".to_string(),
+            ));
         }
 
-        // Check expiration
+        let computed_signature_hash = Sha256::digest(signature.as_bytes());
+        if provided_signature_hash != computed_signature_hash.as_slice() {
+            return Err(ServiceError::Auth("Invalid signature hash".to_string()));
+        }
+
         if claims.exp < Utc::now().timestamp() as usize {
             return Err(ServiceError::Auth("Token expired".to_string()));
         }
 
-        // Clear signature field as it's not needed post-verification
         claims.signature = Vec::new();
         Ok(claims)
     }
