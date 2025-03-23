@@ -10,6 +10,7 @@ mod models;
 mod routes;
 mod services;
 mod stream;
+mod utils;
 
 use config::Config;
 use services::ipfs_service::IPFSService;
@@ -52,7 +53,8 @@ fn start_task_cleanup(ipfs_service: std::sync::Arc<IPFSService>) {
         let mut interval = interval(Duration::from_secs(7200));
         loop {
             interval.tick().await;
-            match ipfs_service.cleanup_old_tasks().await {
+            match utils::cleanup_old_tasks(&ipfs_service.db_pool, ipfs_service.tasks.clone()).await
+            {
                 Ok(()) => log::info!("Task cleanup completed successfully"),
                 Err(e) => log::error!("Task cleanup failed: {}", e),
             }

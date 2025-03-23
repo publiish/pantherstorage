@@ -15,7 +15,7 @@ use serde_with::{serde_as, DisplayFromStr};
 /// };test
 /// ```
 #[serde_as]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub cid: String,
     pub name: String,

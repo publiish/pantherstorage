@@ -1,21 +1,23 @@
 use crate::models::auth::Claims;
-use crate::stream::SizedByteStream;
+use crate::utils::{
+    cleanup_failed_upload, hash_password, insert_file_metadata, insert_initial_task,
+    update_task_status, upload_to_ipfs, verify_password,
+};
 use crate::{
     config::Config,
     errors::ServiceError,
     models::{file_metadata::FileMetadata, requests::*},
 };
-use bcrypt::{hash, verify, DEFAULT_COST};
-use chrono::{Duration, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use futures::Stream;
 use futures_util::StreamExt;
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
 use jsonwebtoken::{encode, EncodingKey, Header};
+use log::error;
 use log::info;
 use mysql_async::{prelude::*, Opts, Pool, Row, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock, Semaphore};
 use uuid::Uuid;
@@ -27,7 +29,7 @@ pub struct IPFSService {
     pub db_pool: Pool,
     pub jwt_secret: String,
     // In-memory task tracking
-    tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
+    pub tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
     // Cap concurrent uploads
     operation_semaphore: Arc<Semaphore>,
     #[allow(dead_code)]
@@ -44,13 +46,13 @@ pub struct UploadStatus {
     pub error: Option<String>,
     // Percentage complete (0.0 to 100.0)
     pub progress: Option<f64>,
-    pub started_at: chrono::DateTime<Utc>,
+    pub started_at: DateTime<Utc>,
 }
 
 /// Task tracking information stored in memory and database
-struct TaskInfo {
-    status: UploadStatus,
-    tx: Option<oneshot::Sender<Result<FileMetadata, ServiceError>>>,
+pub struct TaskInfo {
+    pub status: UploadStatus,
+    pub tx: Option<oneshot::Sender<Result<FileMetadata, ServiceError>>>,
 }
 
 impl IPFSService {
@@ -128,8 +130,7 @@ impl IPFSService {
     pub async fn signup(&self, req: SignupRequest) -> Result<String, ServiceError> {
         req.validate()
             .map_err(|e| ServiceError::Validation(e.to_string()))?;
-        let password_hash = hash(&req.password, DEFAULT_COST)
-            .map_err(|e| ServiceError::Internal(format!("Failed to hash password: {}", e)))?;
+        let password_hash = hash_password(&req.password)?;
         let mut conn = self.db_pool.get_conn().await?;
         let result = conn
             .exec_drop(
@@ -187,9 +188,7 @@ impl IPFSService {
         let (user_id, password_hash) =
             user.ok_or(ServiceError::Auth("Invalid credentials".to_string()))?;
 
-        if !verify(&req.password, &password_hash)
-            .map_err(|e| ServiceError::Internal(format!("Password verification failed: {}", e)))?
-        {
+        if !verify_password(&req.password, &password_hash)? {
             return Err(ServiceError::Auth("Invalid credentials".to_string()));
         }
 
@@ -225,52 +224,24 @@ impl IPFSService {
                 ServiceError::Internal(format!("Failed to acquire semaphore: {}", e))
             })?;
 
-        let (sized_stream, size_tracker) = SizedByteStream::new(file_stream);
+        let (cid, total_size) = upload_to_ipfs(&self.client, file_stream).await?;
 
-        let response = self
-            .client
-            .add_async(sized_stream)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to upload to IPFS: {}", e)))?;
-
-        self.client
-            .pin_add(&response.hash, true)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to pin content: {}", e)))?;
-
-        let total_size = size_tracker.load(Ordering::SeqCst);
         if total_size == 0 {
-            self.cleanup_failed_upload(&response.hash).await?;
+            cleanup_failed_upload(&self.client, &self.db_pool, &cid).await?;
             return Err(ServiceError::InvalidInput(
                 "Empty file uploaded".to_string(),
             ));
         }
 
         let metadata = FileMetadata {
-            cid: response.hash.clone(),
+            cid: cid.clone(),
             name: file_name.clone(),
             size: total_size,
             timestamp: Utc::now(),
             user_id,
         };
 
-        let mut conn = self.db_pool.get_conn().await?;
-        let mut tx = conn
-            .start_transaction(mysql_async::TxOpts::default())
-            .await?;
-
-        tx.exec_drop(
-            "INSERT INTO file_metadata (cid, name, size, timestamp, user_id) VALUES (:cid, :name, :size, :timestamp, :user_id)",
-            params! {
-                "cid" => &metadata.cid,
-                "name" => &metadata.name,
-                "size" => metadata.size,
-                "timestamp" => metadata.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-                "user_id" => user_id,
-            },
-        ).await?;
-
-        tx.commit().await?;
+        insert_file_metadata(&self.db_pool, &cid, &file_name, total_size, user_id, None).await?;
 
         info!(
             "File uploaded successfully: cid={}, size={}, user_id={}",
@@ -278,20 +249,6 @@ impl IPFSService {
         );
 
         Ok(metadata)
-    }
-
-    async fn cleanup_failed_upload(&self, cid: &str) -> Result<(), ServiceError> {
-        self.client
-            .pin_rm(cid, true)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to remove pin: {}", e)))?;
-        let mut conn = self.db_pool.get_conn().await?;
-        conn.exec_drop(
-            "DELETE FROM file_metadata WHERE cid = :cid",
-            params! { "cid" => cid },
-        )
-        .await?;
-        Ok(())
     }
 
     /// Return a pending status and task ID immediately and processes the upload
@@ -335,16 +292,13 @@ impl IPFSService {
         }
 
         // Store initial task in database
-        let mut conn = self.db_pool.get_conn().await?;
-        conn.exec_drop(
-            r"INSERT INTO upload_tasks (task_id, user_id, status, started_at)
-              VALUES (:task_id, :user_id, :status, :started_at)",
-            params! {
-                "task_id" => &task_id,
-                "user_id" => user_id,
-                "status" => &status.status,
-                "started_at" => status.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            },
+        insert_initial_task(
+            &self.db_pool,
+            &task_id,
+            user_id,
+            // Initial status ("pending")
+            &status.status,
+            status.started_at,
         )
         .await?;
 
@@ -362,7 +316,7 @@ impl IPFSService {
                 Ok(_permit) => {
                     let result = Self::process_upload(
                         client,
-                        db_pool,
+                        db_pool.clone(),
                         file_stream,
                         file_name_clone,
                         user_id,
@@ -371,39 +325,54 @@ impl IPFSService {
                     )
                     .await;
 
-                    // Update task status
-                    let mut tasks = tasks.write().await;
-                    if let Some(task_info) = tasks.get_mut(&task_id_clone) {
-                        match &result {
-                            Ok(metadata) => {
-                                task_info.status.status = "completed".to_string();
-                                task_info.status.cid = Some(metadata.cid.clone());
-                                task_info.status.progress = Some(100.0);
-                            }
-                            Err(e) => {
-                                task_info.status.status = "failed".to_string();
-                                task_info.status.error = Some(e.to_string());
-                            }
+                    match result {
+                        Ok(metadata) => {
+                            update_task_status(
+                                tasks,
+                                &db_pool,
+                                &task_id_clone,
+                                "completed",
+                                Some(&metadata.cid),
+                                None,
+                                Some(100.0),
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                error!("Failed to update task status: {}", e);
+                            });
                         }
-                        if let Some(tx) = task_info.tx.take() {
-                            let _ = tx.send(result);
+                        Err(e) => {
+                            update_task_status(
+                                tasks,
+                                &db_pool,
+                                &task_id_clone,
+                                "failed",
+                                None,
+                                Some(&e.to_string()),
+                                None,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                error!("Failed to update task status: {}", e);
+                            });
                         }
                     }
                 }
                 Err(e) => {
                     // Handle semaphore acquisition failure
-                    let mut tasks = tasks.write().await;
-                    if let Some(task_info) = tasks.get_mut(&task_id_clone) {
-                        task_info.status.status = "failed".to_string();
-                        task_info.status.error =
-                            Some(format!("Failed to acquire semaphore: {}", e));
-                        if let Some(tx) = task_info.tx.take() {
-                            let _ = tx.send(Err(ServiceError::Internal(format!(
-                                "Semaphore acquire failed: {}",
-                                e
-                            ))));
-                        }
-                    }
+                    update_task_status(
+                        tasks,
+                        &db_pool,
+                        &task_id_clone,
+                        "failed",
+                        None,
+                        Some(&format!("Failed to acquire semaphore: {}", e)),
+                        None,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("Failed to update task status: {}", e);
+                    });
                 }
             }
         });
@@ -418,80 +387,50 @@ impl IPFSService {
         file_name: String,
         user_id: i32,
         task_id: String,
-        _tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
+        tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
     ) -> Result<FileMetadata, ServiceError>
     where
         S: Stream<Item = Result<Vec<u8>, ServiceError>> + Send + Sync + Unpin + 'static,
     {
-        let (sized_stream, size_tracker) = SizedByteStream::new(file_stream);
-
-        let response = client
-            .add_async(sized_stream)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to upload to IPFS: {}", e)))?;
-
-        client
-            .pin_add(&response.hash, true)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to pin content: {}", e)))?;
-
-        client
-            .pin_rm(&response.hash, true)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("Failed to remove pin: {}", e)))?;
-
-        let total_size = size_tracker.load(Ordering::SeqCst);
-        if total_size == 0 {
-            client
-                .pin_rm(&response.hash, true)
-                .await
-                .map_err(|e| ServiceError::Internal(format!("Failed to remove pin: {}", e)))?;
-            return Err(ServiceError::InvalidInput(
-                "Empty file uploaded".to_string(),
-            ));
-        }
+        let (cid, total_size) = upload_to_ipfs(&client, file_stream).await?;
 
         let metadata = FileMetadata {
-            cid: response.hash.clone(),
+            cid: cid.clone(),
             name: file_name.clone(),
             size: total_size,
             timestamp: Utc::now(),
             user_id,
         };
 
-        let mut conn = db_pool.get_conn().await?;
-        let mut tx = conn
-            .start_transaction(mysql_async::TxOpts::default())
-            .await?;
-
-        // Update file metadata with task_id
-        tx.exec_drop(
-            r"INSERT INTO file_metadata (cid, name, size, timestamp, user_id, task_id)
-              VALUES (:cid, :name, :size, :timestamp, :user_id, :task_id)",
-            params! {
-                "cid" => &metadata.cid,
-                "name" => &metadata.name,
-                "size" => metadata.size,
-                "timestamp" => metadata.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-                "user_id" => user_id,
-                "task_id" => &task_id,
-            },
+        // Insert metadata into the database with task_id
+        insert_file_metadata(
+            &db_pool,
+            &cid,
+            &file_name,
+            total_size,
+            user_id,
+            Some(&task_id),
         )
         .await?;
 
         // Update task status
-        tx.exec_drop(
-            r"UPDATE upload_tasks 
-              SET status = 'completed', cid = :cid, progress = 100.0, completed_at = NOW()
-              WHERE task_id = :task_id",
-            params! {
-                "task_id" => &task_id,
-                "cid" => &metadata.cid,
-            },
+        update_task_status(
+            tasks.clone(),
+            &db_pool,
+            &task_id,
+            "completed",
+            Some(&cid),
+            None,
+            Some(100.0),
         )
         .await?;
 
-        tx.commit().await?;
+        // Send the result back using the tx field
+        if let Some(task_info) = tasks.write().await.get_mut(&task_id) {
+            if let Some(tx) = task_info.tx.take() {
+                let _ = tx.send(Ok(metadata.clone()));
+            }
+        }
 
         info!(
             "File uploaded successfully: cid={}, size={}, user_id={}, task_id={}",
@@ -564,62 +503,6 @@ impl IPFSService {
             }
             None => Err(ServiceError::InvalidInput("Task not found".to_string())),
         }
-    }
-
-    /// Cleans up old upload tasks from memory and database that are older than 2 hours
-    /// and have a status of 'completed' or 'failed'. This should be run periodically.
-    pub async fn cleanup_old_tasks(&self) -> Result<(), ServiceError> {
-        let cutoff_time = Utc::now() - Duration::hours(2);
-        info!("Starting cleanup of tasks older than {}", cutoff_time);
-
-        // Clean up in-memory tasks
-        {
-            let mut tasks = self.tasks.write().await;
-            let initial_count = tasks.len();
-            tasks.retain(|task_id, info| {
-                let keep = info.status.started_at > cutoff_time
-                    || (info.status.status != "completed" && info.status.status != "failed");
-                if !keep {
-                    info!(
-                        "Removing in-memory task {} started at {}",
-                        task_id, info.status.started_at
-                    );
-                }
-                keep
-            });
-            let removed_count = initial_count - tasks.len();
-            info!("Removed {} old tasks from in-memory cache", removed_count);
-        }
-
-        // Clean up database tasks
-        let mut conn = self.db_pool.get_conn().await.map_err(|e| {
-            ServiceError::Internal(format!("Failed to get database connection: {}", e))
-        })?;
-
-        let cutoff_str = cutoff_time.format("%Y-%m-%d %H:%M:%S").to_string();
-        let _affected_rows = conn
-            .exec_drop(
-                r"DELETE FROM upload_tasks 
-                  WHERE started_at < :cutoff 
-                  AND status IN ('completed', 'failed')",
-                params! { "cutoff" => &cutoff_str },
-            )
-            .await
-            .map_err(|e| {
-                ServiceError::Internal(format!("Failed to delete old tasks from database: {}", e))
-            })?;
-
-        let affected_rows_count = conn.affected_rows();
-        if affected_rows_count > 0 {
-            info!(
-                "Removed {} old tasks from upload_tasks table",
-                affected_rows_count
-            );
-        } else {
-            info!("No old tasks found in database to remove");
-        }
-
-        Ok(())
     }
 
     #[allow(dead_code)]
