@@ -3,17 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
 /// Metadata for files stored in IPFS
-///
-/// ```rust
-/// use chrono::Utc;
-/// let metadata = FileMetadata {
-///     cid: "Qm...".to_string(),
-///     name: "example.txt".to_string(),
-///     size: 1024,
-///     timestamp: Utc::now(),
-///     user_id: 1,
-/// };test
-/// ```
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {

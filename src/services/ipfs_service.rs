@@ -12,10 +12,11 @@ use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use futures::Stream;
 use futures_util::StreamExt;
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
-use jsonwebtoken::{encode, EncodingKey, Header};
 use log::error;
 use log::info;
 use mysql_async::{prelude::*, Opts, Pool, Row, Value};
+use pqcrypto_dilithium::dilithium5::{self, DetachedSignature, PublicKey, SecretKey};
+use pqcrypto_traits::sign::DetachedSignature as DetachedSignatureTrait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,11 +24,18 @@ use tokio::sync::{oneshot, RwLock, Semaphore};
 use uuid::Uuid;
 use validator::Validate;
 
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
+use bincode;
+
 /// Service handling IPFS operations and user management
 pub struct IPFSService {
     pub client: IpfsClient,
     pub db_pool: Pool,
-    pub jwt_secret: String,
+    // Dilithium private key
+    pub signing_key: SecretKey,
+    // Dilithium public key
+    pub public_key: PublicKey,
     // In-memory task tracking
     pub tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
     // Cap concurrent uploads
@@ -116,17 +124,21 @@ impl IPFSService {
 
         info!("Database schema initialized");
 
+        // Generate Dilithium keypair
+        let (public_key, signing_key) = pqcrypto_dilithium::dilithium5::keypair();
+
         Ok(Self {
             client,
             db_pool: pool,
             url: config.ipfs_node.clone(),
-            jwt_secret: config.jwt_secret.clone(),
+            signing_key,
+            public_key,
             tasks: Arc::new(RwLock::new(HashMap::new())),
             operation_semaphore: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
         })
     }
 
-    /// Registers a new user and returns a JWT token
+    /// Registers a new user and returns a PQC Auth token
     pub async fn signup(&self, req: SignupRequest) -> Result<String, ServiceError> {
         req.validate()
             .map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -160,20 +172,25 @@ impl IPFSService {
         let claims = Claims {
             sub: user_id.to_string(),
             exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
+            signature: Vec::new(),
         };
 
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
-        )
-        .map_err(|e| ServiceError::Internal(format!("Failed to generate token: {}", e)))?;
+        // Serialize claims and sign with Dilithium
+        let claims_bytes = bincode::encode_to_vec(&claims, bincode::config::standard())
+            .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?;
+        let signature = dilithium5::detached_sign(&claims_bytes, &self.signing_key);
+        let mut signed_claims = claims;
+        signed_claims.signature = signature.as_bytes().to_vec();
 
+        let token = Base64Engine.encode(
+            bincode::encode_to_vec(&signed_claims, bincode::config::standard())
+                .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?,
+        );
         info!("New user signed up: {}", req.email);
         Ok(token)
     }
 
-    /// Authenticates a user and returns a JWT token
+    /// Authenticates a user and returns a PQC Auth token
     pub async fn signin(&self, req: SigninRequest) -> Result<String, ServiceError> {
         req.validate()
             .map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -195,17 +212,54 @@ impl IPFSService {
         let claims = Claims {
             sub: user_id.to_string(),
             exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
+            signature: Vec::new(),
         };
 
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
-        )
-        .map_err(|e| ServiceError::Internal(format!("Failed to generate token: {}", e)))?;
+        let claims_bytes = bincode::encode_to_vec(&claims, bincode::config::standard())
+            .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?;
+        let signature = dilithium5::detached_sign(&claims_bytes, &self.signing_key);
+        println!("Signature size: {}", signature.as_bytes().len());
+        let mut signed_claims = claims;
+        signed_claims.signature = signature.as_bytes().to_vec();
 
+        let token = Base64Engine.encode(
+            bincode::encode_to_vec(&signed_claims, bincode::config::standard())
+                .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?,
+        );
         info!("User signed in: {}", req.email);
         Ok(token)
+    }
+
+    pub fn verify_token(&self, token: &str) -> Result<Claims, ServiceError> {
+        let decoded = Base64Engine
+            .decode(token)
+            .map_err(|e| ServiceError::Auth(format!("Invalid token format: {}", e)))?;
+
+        let (claims, _): (Claims, usize) =
+            bincode::decode_from_slice(&decoded, bincode::config::standard())
+                .map_err(|e| ServiceError::Auth(format!("Failed to deserialize claims: {}", e)))?;
+
+        let signature = DetachedSignature::from_bytes(&claims.signature)
+            .map_err(|e| ServiceError::Auth(format!("Invalid signature format: {}", e)))?;
+        let claims_no_sig = Claims {
+            sub: claims.sub.clone(),
+            exp: claims.exp,
+            signature: Vec::new(),
+        };
+        let claims_bytes = bincode::encode_to_vec(&claims_no_sig, bincode::config::standard())
+            .map_err(|e| ServiceError::Internal(format!("Serialization failed: {}", e)))?;
+
+        match dilithium5::verify_detached_signature(&signature, &claims_bytes, &self.public_key) {
+            // Signature is valid
+            Ok(()) => (),
+            Err(_) => return Err(ServiceError::Auth("Invalid signature".to_string())),
+        }
+
+        if claims.exp < Utc::now().timestamp() as usize {
+            return Err(ServiceError::Auth("Token expired".to_string()));
+        }
+
+        Ok(claims)
     }
 
     /// Performs file upload synchronously and stores its metadata

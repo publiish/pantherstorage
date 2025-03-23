@@ -56,7 +56,7 @@ impl From<bcrypt::BcryptError> for ServiceError {
 
 impl From<jsonwebtoken::errors::Error> for ServiceError {
     fn from(err: jsonwebtoken::errors::Error) -> Self {
-        ServiceError::Internal(format!("JWT error: {}", err))
+        ServiceError::Internal(format!("PQC error: {}", err))
     }
 }
 

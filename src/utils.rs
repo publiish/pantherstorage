@@ -1,9 +1,7 @@
 use crate::stream::SizedByteStream;
 use crate::{errors::ServiceError, services::ipfs_service::TaskInfo};
 use bcrypt::{hash, verify, DEFAULT_COST};
-use chrono::DateTime;
-use chrono::Duration;
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use futures::Stream;
 use ipfs_api::{IpfsApi, IpfsClient};
 use log::info;

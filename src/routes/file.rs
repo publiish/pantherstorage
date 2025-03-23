@@ -1,9 +1,7 @@
-use crate::models::auth::Claims;
 use crate::{errors::ServiceError, models::requests::*, services::ipfs_service::IPFSService};
 use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
 use futures_util::StreamExt;
-use jsonwebtoken::{decode, DecodingKey, Validation};
 use mime_guess::from_path;
 use sanitize_filename::sanitize;
 use std::collections::HashMap;
@@ -200,7 +198,7 @@ async fn get_metadata(
     Ok(HttpResponse::Ok().json(metadata))
 }
 
-/// Verifies JWT token from request headers
+/// Verifies token from request headers using PQC signature verification
 async fn verify_token(req: HttpRequest, service: &IPFSService) -> Result<i32, ServiceError> {
     let auth_header = req
         .headers()
@@ -215,15 +213,8 @@ async fn verify_token(req: HttpRequest, service: &IPFSService) -> Result<i32, Se
         .strip_prefix("Bearer ")
         .ok_or(ServiceError::Auth("Invalid token format".to_string()))?;
 
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(service.jwt_secret.as_bytes()),
-        &Validation::default(),
-    )
-    .map_err(|_| ServiceError::Auth("Invalid token".to_string()))?;
-
-    token_data
-        .claims
+    let claims = service.verify_token(token)?;
+    claims
         .sub
         .parse::<i32>()
         .map_err(|_| ServiceError::Internal("Failed to parse user ID".to_string()))

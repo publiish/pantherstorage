@@ -5,7 +5,6 @@ pub struct Config {
     pub ipfs_node: String,
     pub database_url: String,
     pub bind_address: String,
-    pub jwt_secret: String,
     pub max_concurrent_uploads: usize,
 }
 
@@ -27,7 +26,6 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:5001".to_string()),
             database_url: env::var("DATABASE_URL")?,
             bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8081".to_string()),
-            jwt_secret: env::var("JWT_SECRET")?,
             max_concurrent_uploads,
         })
     }
