@@ -1,4 +1,4 @@
-use crate::models::auth::Claims;
+use crate::models::auth::{Claims, TokenHeader};
 use crate::utils::{
     cleanup_failed_upload, hash_password, insert_file_metadata, insert_initial_task,
     update_task_status, upload_to_ipfs, verify_password,
@@ -27,12 +27,6 @@ use validator::Validate;
 
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
-
-#[derive(Serialize, Deserialize)]
-struct TokenHeader {
-    alg: String,
-    typ: String,
-}
 
 /// Service handling IPFS operations and user management
 pub struct IPFSService {
@@ -144,6 +138,39 @@ impl IPFSService {
         })
     }
 
+    /// Generates a PQC authentication token for a given user ID
+    fn generate_token(&self, user_id: i32, duration: Duration) -> Result<String, ServiceError> {
+        let header = TokenHeader {
+            alg: "Dilithium5".to_string(),
+            typ: "PQC".to_string(),
+            nonce: Uuid::new_v4().to_string(),
+        };
+
+        let claims = Claims {
+            sub: user_id.to_string(),
+            exp: (Utc::now() + duration).timestamp() as usize,
+            signature: Vec::new(),
+            iat: Utc::now().timestamp() as usize,
+            nonce: Uuid::new_v4().to_string(),
+        };
+
+        let header_json = serde_json::to_string(&header)?;
+        let payload_json = serde_json::to_string(&claims)?;
+        let header_encoded = Base64Engine.encode(header_json);
+        let payload_encoded = Base64Engine.encode(payload_json);
+
+        let message = format!("{}.{}", header_encoded, payload_encoded);
+        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
+
+        let signature_hash = Sha256::digest(signature.as_bytes());
+        let signature_encoded = Base64Engine.encode(&signature_hash);
+
+        Ok(format!(
+            "{}.{}.{}",
+            header_encoded, payload_encoded, signature_encoded
+        ))
+    }
+
     /// Registers a new user and returns a PQC Auth token
     pub async fn signup(&self, req: SignupRequest) -> Result<String, ServiceError> {
         req.validate()
@@ -175,36 +202,7 @@ impl IPFSService {
             .await?
             .ok_or_else(|| ServiceError::Internal("Failed to get user ID".to_string()))?;
 
-        let header = TokenHeader {
-            alg: "Dilithium5".to_string(),
-            typ: "PQC".to_string(),
-        };
-
-        let claims = Claims {
-            sub: user_id.to_string(),
-            exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
-            signature: Vec::new(),
-        };
-
-        // Serialize header and claims to JSON
-        let header_json = serde_json::to_string(&header)?;
-        let payload_json = serde_json::to_string(&claims)?;
-        // Base64URL encode header and payload
-        let header_encoded = Base64Engine.encode(header_json);
-        let payload_encoded = Base64Engine.encode(payload_json);
-
-        // Create message to sign: "header.payload"
-        let message = format!("{}.{}", header_encoded, payload_encoded);
-        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
-
-        let signature_hash = Sha256::digest(signature.as_bytes());
-        let signature_encoded = Base64Engine.encode(&signature_hash);
-
-        // Construct token
-        let token = format!(
-            "{}.{}.{}",
-            header_encoded, payload_encoded, signature_encoded
-        );
+        let token = self.generate_token(user_id, Duration::hours(12))?;
         info!("New user signed up: {}", req.email);
         Ok(token)
     }
@@ -228,32 +226,8 @@ impl IPFSService {
             return Err(ServiceError::Auth("Invalid credentials".to_string()));
         }
 
-        let header = TokenHeader {
-            alg: "Dilithium5".to_string(),
-            typ: "PQC".to_string(),
-        };
+        let token = self.generate_token(user_id, Duration::hours(6))?;
 
-        let claims = Claims {
-            sub: user_id.to_string(),
-            exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
-            signature: Vec::new(),
-        };
-
-        let header_json = serde_json::to_string(&header)?;
-        let payload_json = serde_json::to_string(&claims)?;
-        let header_encoded = Base64Engine.encode(header_json);
-        let payload_encoded = Base64Engine.encode(payload_json);
-
-        let message = format!("{}.{}", header_encoded, payload_encoded);
-        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
-
-        let signature_hash = Sha256::digest(signature.as_bytes());
-        let signature_encoded = Base64Engine.encode(&signature_hash);
-
-        let token = format!(
-            "{}.{}.{}",
-            header_encoded, payload_encoded, signature_encoded
-        );
         info!("User signed in: {}", req.email);
         Ok(token)
     }
