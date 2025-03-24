@@ -1,6 +1,8 @@
 use actix_web::{http::StatusCode, HttpResponse};
+use base64::DecodeError as Base64DecodeError;
 use hyper::http::uri::InvalidUri;
 use serde::Serialize;
+use serde_json::Error as SerdeJsonError;
 use std::sync::PoisonError;
 use thiserror::Error;
 
@@ -54,12 +56,6 @@ impl From<bcrypt::BcryptError> for ServiceError {
     }
 }
 
-impl From<jsonwebtoken::errors::Error> for ServiceError {
-    fn from(err: jsonwebtoken::errors::Error) -> Self {
-        ServiceError::Internal(format!("JWT error: {}", err))
-    }
-}
-
 impl From<validator::ValidationErrors> for ServiceError {
     fn from(err: validator::ValidationErrors) -> Self {
         ServiceError::Validation(err.to_string())
@@ -76,6 +72,18 @@ impl From<actix_multipart::MultipartError> for ServiceError {
 impl<T> From<PoisonError<T>> for ServiceError {
     fn from(err: PoisonError<T>) -> Self {
         ServiceError::Internal(format!("Mutex lock failed: {}", err))
+    }
+}
+
+impl From<SerdeJsonError> for ServiceError {
+    fn from(err: SerdeJsonError) -> Self {
+        ServiceError::Internal(format!("Serialization error: {}", err))
+    }
+}
+
+impl From<Base64DecodeError> for ServiceError {
+    fn from(err: Base64DecodeError) -> Self {
+        ServiceError::Auth(format!("Base64 decoding error: {}", err))
     }
 }
 

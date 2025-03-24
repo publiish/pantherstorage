@@ -206,7 +206,7 @@ Set up environment variables (example in `.env` file):
 DATABASE_URL=mysql://root:password@localhost:3306/publiish_local
 IPFS_NODE=http://127.0.0.1:5001
 BIND_ADDRESS=127.0.0.1:8081
-JWT_SECRET=e03982f1254997738bb3cb3c053d0ec266e6fd1fb22aa2622470ea31f4a27f5e
+MAX_CONCURRENT_UPLOADS=42
 RUST_LOG=info
 ```
 

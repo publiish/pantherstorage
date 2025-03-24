@@ -1,4 +1,4 @@
-use crate::models::auth::Claims;
+use crate::models::auth::{Claims, TokenHeader};
 use crate::utils::{
     cleanup_failed_upload, hash_password, insert_file_metadata, insert_initial_task,
     update_task_status, upload_to_ipfs, verify_password,
@@ -12,22 +12,33 @@ use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use futures::Stream;
 use futures_util::StreamExt;
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
-use jsonwebtoken::{encode, EncodingKey, Header};
 use log::error;
 use log::info;
 use mysql_async::{prelude::*, Opts, Pool, Row, Value};
+use pqcrypto_dilithium::dilithium5::{self, PublicKey, SecretKey};
+use pqcrypto_traits::sign::{
+    DetachedSignature as DetachedSignatureTrait, PublicKey as OtherPublicKey,
+    SecretKey as OtherSecretKey,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock, Semaphore};
 use uuid::Uuid;
 use validator::Validate;
 
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
+
 /// Service handling IPFS operations and user management
 pub struct IPFSService {
     pub client: IpfsClient,
     pub db_pool: Pool,
-    pub jwt_secret: String,
+    // Dilithium private key
+    pub signing_key: SecretKey,
+    // Dilithium public key
+    pub public_key: PublicKey,
     // In-memory task tracking
     pub tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
     // Cap concurrent uploads
@@ -116,17 +127,78 @@ impl IPFSService {
 
         info!("Database schema initialized");
 
+        // Decode Base64 keys from config
+        let public_key_bytes = Base64Engine
+            .decode(&config.dilithium_public_key)
+            .map_err(|e| ServiceError::Internal(format!("Failed to decode public key: {}", e)))?;
+        let secret_key_bytes = Base64Engine
+            .decode(&config.dilithium_secret_key)
+            .map_err(|e| ServiceError::Internal(format!("Failed to decode secret key: {}", e)))?;
+
+        // Log the Public keys as Base64 strings
+        info!(
+            "Public Key (Base64): {}",
+            Base64Engine.encode(&public_key_bytes)
+        );
+        // Log the SecretKey (! in Production)
+        info!(
+            "Secret Key (Base64): {}",
+            Base64Engine.encode(&secret_key_bytes)
+        );
+
+        // Convert bytes to Dilithium key types
+        let public_key = PublicKey::from_bytes(&public_key_bytes).map_err(|e| {
+            ServiceError::Internal(format!("Invalid Dilithium public key format: {}", e))
+        })?;
+        let signing_key = SecretKey::from_bytes(&secret_key_bytes).map_err(|e| {
+            ServiceError::Internal(format!("Invalid Dilithium secret key format: {}", e))
+        })?;
+
         Ok(Self {
             client,
             db_pool: pool,
             url: config.ipfs_node.clone(),
-            jwt_secret: config.jwt_secret.clone(),
+            signing_key,
+            public_key,
             tasks: Arc::new(RwLock::new(HashMap::new())),
             operation_semaphore: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
         })
     }
 
-    /// Registers a new user and returns a JWT token
+    /// Generates a PQC authentication token for a given user ID
+    fn generate_token(&self, user_id: i32, duration: Duration) -> Result<String, ServiceError> {
+        let header = TokenHeader {
+            alg: "Dilithium5".to_string(),
+            typ: "PQC".to_string(),
+            nonce: Uuid::new_v4().to_string(),
+        };
+
+        let claims = Claims {
+            sub: user_id.to_string(),
+            exp: (Utc::now() + duration).timestamp() as usize,
+            signature: Vec::new(),
+            iat: Utc::now().timestamp() as usize,
+            nonce: Uuid::new_v4().to_string(),
+        };
+
+        let header_json = serde_json::to_string(&header)?;
+        let payload_json = serde_json::to_string(&claims)?;
+        let header_encoded = Base64Engine.encode(header_json);
+        let payload_encoded = Base64Engine.encode(payload_json);
+
+        let message = format!("{}.{}", header_encoded, payload_encoded);
+        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
+
+        let signature_hash = Sha256::digest(signature.as_bytes());
+        let signature_encoded = Base64Engine.encode(&signature_hash);
+
+        Ok(format!(
+            "{}.{}.{}",
+            header_encoded, payload_encoded, signature_encoded
+        ))
+    }
+
+    /// Registers a new user and returns a PQC Auth token
     pub async fn signup(&self, req: SignupRequest) -> Result<String, ServiceError> {
         req.validate()
             .map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -157,23 +229,12 @@ impl IPFSService {
             .await?
             .ok_or_else(|| ServiceError::Internal("Failed to get user ID".to_string()))?;
 
-        let claims = Claims {
-            sub: user_id.to_string(),
-            exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
-        };
-
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
-        )
-        .map_err(|e| ServiceError::Internal(format!("Failed to generate token: {}", e)))?;
-
+        let token = self.generate_token(user_id, Duration::hours(12))?;
         info!("New user signed up: {}", req.email);
         Ok(token)
     }
 
-    /// Authenticates a user and returns a JWT token
+    /// Authenticates a user and returns a PQC Auth token
     pub async fn signin(&self, req: SigninRequest) -> Result<String, ServiceError> {
         req.validate()
             .map_err(|e| ServiceError::Validation(e.to_string()))?;
@@ -192,20 +253,60 @@ impl IPFSService {
             return Err(ServiceError::Auth("Invalid credentials".to_string()));
         }
 
-        let claims = Claims {
-            sub: user_id.to_string(),
-            exp: (Utc::now() + Duration::days(1)).timestamp() as usize,
-        };
-
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
-        )
-        .map_err(|e| ServiceError::Internal(format!("Failed to generate token: {}", e)))?;
+        let token = self.generate_token(user_id, Duration::hours(6))?;
 
         info!("User signed in: {}", req.email);
         Ok(token)
+    }
+
+    pub fn verify_token(&self, token: &str) -> Result<Claims, ServiceError> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(ServiceError::Auth("Invalid token format".to_string()));
+        }
+
+        let header_encoded = parts[0];
+        let payload_encoded = parts[1];
+        let signature_encoded = parts[2];
+
+        let header_json = Base64Engine.decode(header_encoded)?;
+        let header: TokenHeader = serde_json::from_slice(&header_json)?;
+        if header.alg != "Dilithium5" || header.typ != "PQC" {
+            return Err(ServiceError::Auth(
+                "Unsupported algorithm or type".to_string(),
+            ));
+        }
+
+        let payload_json = Base64Engine.decode(payload_encoded)?;
+        let mut claims: Claims = serde_json::from_slice(&payload_json)?;
+
+        let provided_signature_hash = Base64Engine.decode(signature_encoded)?;
+        if provided_signature_hash.len() != 32 {
+            return Err(ServiceError::Auth("Invalid signature length".to_string()));
+        }
+
+        let message = format!("{}.{}", header_encoded, payload_encoded);
+        let signature = dilithium5::detached_sign(message.as_bytes(), &self.signing_key);
+
+        if dilithium5::verify_detached_signature(&signature, message.as_bytes(), &self.public_key)
+            .is_err()
+        {
+            return Err(ServiceError::Auth(
+                "Signature verification failed".to_string(),
+            ));
+        }
+
+        let computed_signature_hash = Sha256::digest(signature.as_bytes());
+        if provided_signature_hash != computed_signature_hash.as_slice() {
+            return Err(ServiceError::Auth("Invalid signature hash".to_string()));
+        }
+
+        if claims.exp < Utc::now().timestamp() as usize {
+            return Err(ServiceError::Auth("Token expired".to_string()));
+        }
+
+        claims.signature = Vec::new();
+        Ok(claims)
     }
 
     /// Performs file upload synchronously and stores its metadata
