@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// POC Token Header
+/// Post-Quantum Safe Auth Token Header.
 #[derive(Serialize, Deserialize)]
 pub struct TokenHeader {
     pub alg: String,
@@ -8,7 +8,7 @@ pub struct TokenHeader {
     pub nonce: String,
 }
 
-/// PQC Claims for authentication tokens
+/// PQS Token Claims
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -20,7 +20,7 @@ pub struct Claims {
     pub nonce: String,
 }
 
-/// Response containing authentication token
+/// Auth Response containing PQS token
 #[derive(Serialize)]
 pub struct AuthResponse {
     pub token: String,
