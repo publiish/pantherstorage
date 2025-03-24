@@ -227,6 +227,11 @@ Run the built binary:
 ./target/release/publiish-api
 ```
 
+Generate the `Dilithium keys` and update `.env` file with `DILITHIUM_PUBLIC_KEY` and `DILITHIUM_PRIVATE_KEY`:
+```sh
+cargo run -- generate-keys --base64
+```
+
 ## API Documentation
 
 This document provides an overview of the available API endpoints, their expected request formats, and example curl commands for testing.
@@ -234,7 +239,7 @@ This document provides an overview of the available API endpoints, their expecte
 ### Endpoints Workflow
 
 - **POST** `/api/signup` - Register a new user
-- **POST** `/api/signin` - Authenticate a user and get a JWT
+- **POST** `/api/signin` - Authenticate a user and get a PQS token
 - **POST** `/api/upload` - Upload a file (requires authentication)
 - **POST** `/api/delete` - Unpin a file (requires authentication)
 - **GET** `/api/pins` - List pinned files (requires authentication)
@@ -246,7 +251,7 @@ This document provides an overview of the available API endpoints, their expecte
 
 ### 1. Signup
 
-- **Description:** Registers a new user and returns a JWT token.
+- **Description:** Registers a new user and returns a PQS token.
 - **Method:** POST
 - **Endpoint:** `/api/signup`
 - **Request Body:**
@@ -277,7 +282,7 @@ This document provides an overview of the available API endpoints, their expecte
 
 ### 2. Signin
 
-- **Description:** Authenticates a user and returns a JWT token.
+- **Description:** Authenticates a user and returns a PQS token.
 - **Method:** POST
 - **Endpoint:** `/api/signin`
 - **Request Body:**
@@ -343,7 +348,7 @@ This document provides an overview of the available API endpoints, their expecte
   ```bash
   curl -X POST http://0.0.0.0:8081/api/upload \
   -H "Content-Type: multipart/form-data" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "Authorization: Bearer <PQS_TOKEN>" \
   -F "file=@/path/to/example.txt"
   ```
 
@@ -351,7 +356,7 @@ This document provides an overview of the available API endpoints, their expecte
 
   ```bash
   curl -X POST http://0.0.0.0:8081/api/upload?async=true \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "Authorization: Bearer <PQS_TOKEN>" \
   -H "Content-Type: multipart/form-data" \
   -F "file=@/path/to/example.txt"
   ```
@@ -361,7 +366,7 @@ This document provides an overview of the available API endpoints, their expecte
 - **Description:** Downloads a file buffer stream from IPFS.
 - **Method:** GET
 - **Endpoint:** `/api/download/{cid}`
-- **Request Headers:** Authorization: Bearer <JWT_TOKEN>
+- **Request Headers:** Authorization: Bearer <PQS_TOKEN>
 - **Response:** File fetched by user. Binary file content with appropriate `Content-Type` and `Content-Disposition` headers.
 - **Notes:** The `Content-Type` is inferred from the file extension, defaulting to `application/octet-stream`.
 
@@ -369,7 +374,7 @@ This document provides an overview of the available API endpoints, their expecte
 
   ```bash
   curl -X GET http://localhost:8081/api/download/QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "Authorization: Bearer <PQS_TOKEN>" \
   -o testfile
   ```
 
@@ -393,7 +398,7 @@ This document provides an overview of the available API endpoints, their expecte
   ```bash
   curl -X POST http://0.0.0.0:8081/api/delete \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "Authorization: Bearer <PQS_TOKEN>" \
   -d '{"cid": "QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o"}'
   ```
 
@@ -412,7 +417,7 @@ This document provides an overview of the available API endpoints, their expecte
 
   ```bash
   curl -X GET http://0.0.0.0:8081/api/pins \
-  -H "Authorization: Bearer <JWT_TOKEN>"
+  -H "Authorization: Bearer <PQS_TOKEN>"
   ```
 
 ### 7. Get File Metadata
@@ -436,7 +441,7 @@ This document provides an overview of the available API endpoints, their expecte
 
   ```bash
   curl -X GET http://0.0.0.0:8081/api/metadata/QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o \
-  -H "Authorization: Bearer <JWT_TOKEN>"
+  -H "Authorization: Bearer <PQS_TOKEN>"
   ```
 
 ### 8. Get Upload Status
@@ -461,5 +466,5 @@ This document provides an overview of the available API endpoints, their expecte
 
   ```bash
   curl -X GET http://0.0.0.0:8081/api/upload/status/c21fc79c-44e4-4d87-9321-1adf6a4fc1df \
-  -H "Authorization: Bearer <JWT_TOKEN>"
+  -H "Authorization: Bearer <PQS_TOKEN>"
   ```
