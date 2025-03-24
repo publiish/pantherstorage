@@ -127,13 +127,16 @@ impl IPFSService {
 
         info!("Database schema initialized");
 
-        // Decode Base64 keys from config
-        let public_key_bytes = Base64Engine
-            .decode(&config.dilithium_public_key)
-            .map_err(|e| ServiceError::Internal(format!("Failed to decode public key: {}", e)))?;
-        let secret_key_bytes = Base64Engine
-            .decode(&config.dilithium_secret_key)
-            .map_err(|e| ServiceError::Internal(format!("Failed to decode secret key: {}", e)))?;
+        let public_key = config
+            .get_public_key()
+            .map_err(|e| ServiceError::Internal(e))?;
+        let signing_key = config
+            .get_secret_key()
+            .map_err(|e| ServiceError::Internal(e))?;
+
+        // Get the bytes for logging
+        let public_key_bytes = public_key.as_bytes();
+        let secret_key_bytes = signing_key.as_bytes();
 
         // Log the Public keys as Base64 strings
         info!(
@@ -145,14 +148,6 @@ impl IPFSService {
             "Secret Key (Base64): {}",
             Base64Engine.encode(&secret_key_bytes)
         );
-
-        // Convert bytes to Dilithium key types
-        let public_key = PublicKey::from_bytes(&public_key_bytes).map_err(|e| {
-            ServiceError::Internal(format!("Invalid Dilithium public key format: {}", e))
-        })?;
-        let signing_key = SecretKey::from_bytes(&secret_key_bytes).map_err(|e| {
-            ServiceError::Internal(format!("Invalid Dilithium secret key format: {}", e))
-        })?;
 
         Ok(Self {
             client,

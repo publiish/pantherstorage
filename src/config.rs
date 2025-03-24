@@ -1,3 +1,7 @@
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
+use pqcrypto_dilithium::dilithium5::{PublicKey, SecretKey};
+use pqcrypto_traits::sign::{PublicKey as OtherPublicKey, SecretKey as OtherSecretKey};
 use std::env;
 
 /// Configuration settings
@@ -6,9 +10,9 @@ pub struct Config {
     pub database_url: String,
     pub bind_address: String,
     // Base64-encoded public key
-    pub dilithium_public_key: String,
+    dilithium_public_key: String,
     // Base64-encoded secret key
-    pub dilithium_secret_key: String,
+    dilithium_secret_key: String,
     pub max_concurrent_uploads: usize,
 }
 
@@ -34,5 +38,21 @@ impl Config {
             dilithium_secret_key: env::var("DILITHIUM_SECRET_KEY")?,
             max_concurrent_uploads,
         })
+    }
+
+    pub fn get_public_key(&self) -> Result<PublicKey, String> {
+        let public_key_bytes = Base64Engine
+            .decode(&self.dilithium_public_key)
+            .map_err(|e| format!("Failed to decode public key: {}", e))?;
+        PublicKey::from_bytes(&public_key_bytes)
+            .map_err(|e| format!("Invalid Dilithium public key format: {}", e))
+    }
+
+    pub fn get_secret_key(&self) -> Result<SecretKey, String> {
+        let secret_key_bytes = Base64Engine
+            .decode(&self.dilithium_secret_key)
+            .map_err(|e| format!("Failed to decode secret key: {}", e))?;
+        SecretKey::from_bytes(&secret_key_bytes)
+            .map_err(|e| format!("Invalid Dilithium secret key format: {}", e))
     }
 }
