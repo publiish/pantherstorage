@@ -36,7 +36,7 @@ pub struct IPFSService {
     pub client: IpfsClient,
     pub db_pool: Pool,
     // Dilithium private key
-    pub signing_key: SecretKey,
+    signing_key: SecretKey,
     // Dilithium public key
     pub public_key: PublicKey,
     // In-memory task tracking
