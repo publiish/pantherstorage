@@ -1,4 +1,6 @@
-use crate::{errors::ServiceError, models::requests::*, services::ipfs_service::IPFSService};
+use crate::{
+    database, errors::ServiceError, models::requests::*, services::ipfs_service::IPFSService,
+};
 use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
 use futures_util::StreamExt;
@@ -81,9 +83,7 @@ async fn get_upload_status_handler(
     let task_id = path.into_inner();
     let user_id = verify_token(http_req, &state.ipfs_service).await?;
 
-    let status = state
-        .ipfs_service
-        .get_upload_status(&task_id, user_id)
+    let status = database::get_upload_status(&state.ipfs_service, &task_id, user_id)
         .await
         .map_err(|e| {
             log::error!("Failed to get upload status for task {}: {}", task_id, e);

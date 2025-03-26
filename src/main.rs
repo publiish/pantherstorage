@@ -7,6 +7,7 @@ use std::io;
 use tokio::time::{interval, Duration};
 
 mod config;
+mod database;
 mod errors;
 mod middleware;
 mod models;

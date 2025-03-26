@@ -1,32 +1,32 @@
-use crate::models::auth::{Claims, TokenHeader};
-use crate::utils::{
-    cleanup_failed_upload, hash_password, insert_file_metadata, insert_initial_task,
-    update_task_status, upload_to_ipfs, verify_password,
-};
 use crate::{
     config::Config,
+    database::{
+        cleanup_failed_upload, init_schema, insert_file_metadata, insert_initial_task, login_user,
+        register_user, update_task_status,
+    },
     errors::ServiceError,
-    models::{file_metadata::FileMetadata, requests::*},
+    models::{
+        auth::{Claims, TokenHeader},
+        file_metadata::*,
+        requests::*,
+    },
+    utils::upload_to_ipfs,
 };
-use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
+use chrono::{Duration, NaiveDateTime, TimeZone, Utc};
 use futures::Stream;
 use futures_util::StreamExt;
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
-use log::error;
-use log::info;
+use log::{error, info};
 use mysql_async::{prelude::*, Opts, Pool, Row, Value};
 use pqcrypto_dilithium::dilithium5::{self, PublicKey, SecretKey};
 use pqcrypto_traits::sign::{
     DetachedSignature as DetachedSignatureTrait, PublicKey as OtherPublicKey,
     SecretKey as OtherSecretKey,
 };
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{oneshot, RwLock, Semaphore};
 use uuid::Uuid;
-use validator::Validate;
 
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
@@ -47,25 +47,6 @@ pub struct IPFSService {
     pub url: String,
 }
 
-/// Upload status response
-#[derive(Serialize, Deserialize, Clone)]
-pub struct UploadStatus {
-    pub task_id: String,
-    // "pending", "completed", "failed"
-    pub status: String,
-    pub cid: Option<String>,
-    pub error: Option<String>,
-    // Percentage complete (0.0 to 100.0)
-    pub progress: Option<f64>,
-    pub started_at: DateTime<Utc>,
-}
-
-/// Task tracking information stored in memory and database
-pub struct TaskInfo {
-    pub status: UploadStatus,
-    pub tx: Option<oneshot::Sender<Result<FileMetadata, ServiceError>>>,
-}
-
 impl IPFSService {
     /// Initializes a new IPFS service instance
     pub async fn new(config: &Config) -> Result<Self, ServiceError> {
@@ -78,54 +59,9 @@ impl IPFSService {
 
         let opts = Opts::from_url(&config.database_url)?;
         let pool = Pool::new(opts);
-        let mut conn = pool.get_conn().await?;
 
-        conn.query_drop(
-            r"CREATE TABLE IF NOT EXISTS users (
-                id INT PRIMARY KEY AUTO_INCREMENT,
-                username VARCHAR(50) NOT NULL UNIQUE,
-                email VARCHAR(100) NOT NULL UNIQUE,
-                password_hash VARCHAR(255) NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_email (email)
-            )",
-        )
-        .await?;
-
-        conn.query_drop(
-            r"CREATE TABLE IF NOT EXISTS file_metadata (
-                id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                cid VARCHAR(100) NOT NULL UNIQUE,
-                name VARCHAR(255) NOT NULL,
-                size BIGINT NOT NULL,
-                timestamp DATETIME NOT NULL,
-                user_id INT NOT NULL,
-                task_id VARCHAR(36),
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                INDEX idx_cid (cid),
-                INDEX idx_user_id (user_id),
-                INDEX idx_task_id (task_id)
-            )",
-        )
-        .await?;
-
-        conn.query_drop(
-            r"CREATE TABLE IF NOT EXISTS upload_tasks (
-                task_id VARCHAR(36) PRIMARY KEY,
-                user_id INT NOT NULL,
-                status VARCHAR(20) NOT NULL,
-                cid VARCHAR(100),
-                error TEXT,
-                progress DOUBLE DEFAULT 0.0,
-                started_at DATETIME NOT NULL,
-                completed_at DATETIME,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                INDEX idx_user_id (user_id)
-            )",
-        )
-        .await?;
-
-        info!("Database schema initialized");
+        // Initialize database schema
+        init_schema(&pool).await?;
 
         let public_key = config
             .get_public_key()
@@ -195,62 +131,15 @@ impl IPFSService {
 
     /// Registers a new user and returns a PQC Auth token
     pub async fn signup(&self, req: SignupRequest) -> Result<String, ServiceError> {
-        req.validate()
-            .map_err(|e| ServiceError::Validation(e.to_string()))?;
-        let password_hash = hash_password(&req.password)?;
-        let mut conn = self.db_pool.get_conn().await?;
-        let result = conn
-            .exec_drop(
-                "INSERT INTO users (username, email, password_hash) VALUES (:username, :email, :password_hash)",
-                params! {
-                    "username" => &req.username,
-                    "email" => &req.email,
-                    "password_hash" => &password_hash,
-                },
-            )
-            .await;
-
-        if let Err(mysql_async::Error::Server(err)) = &result {
-            if err.code == 1062 {
-                return Err(ServiceError::InvalidInput(
-                    "Username or email already exists".to_string(),
-                ));
-            }
-        }
-        result?;
-
-        let user_id: i32 = conn
-            .query_first("SELECT LAST_INSERT_ID()")
-            .await?
-            .ok_or_else(|| ServiceError::Internal("Failed to get user ID".to_string()))?;
-
+        let user_id = register_user(&self.db_pool, &req).await?;
         let token = self.generate_token(user_id, Duration::hours(12))?;
-        info!("New user signed up: {}", req.email);
         Ok(token)
     }
 
     /// Authenticates a user and returns a PQC Auth token
     pub async fn signin(&self, req: SigninRequest) -> Result<String, ServiceError> {
-        req.validate()
-            .map_err(|e| ServiceError::Validation(e.to_string()))?;
-        let mut conn = self.db_pool.get_conn().await?;
-        let user: Option<(i32, String)> = conn
-            .exec_first(
-                "SELECT id, password_hash FROM users WHERE email = :email",
-                params! { "email" => &req.email },
-            )
-            .await?;
-
-        let (user_id, password_hash) =
-            user.ok_or(ServiceError::Auth("Invalid credentials".to_string()))?;
-
-        if !verify_password(&req.password, &password_hash)? {
-            return Err(ServiceError::Auth("Invalid credentials".to_string()));
-        }
-
-        let token = self.generate_token(user_id, Duration::hours(6))?;
-
-        info!("User signed in: {}", req.email);
+        let user_id = login_user(&self.db_pool, &req).await?;
+        let token = self.generate_token(user_id, Duration::hours(12))?;
         Ok(token)
     }
 
@@ -534,103 +423,6 @@ impl IPFSService {
         );
 
         Ok(metadata)
-    }
-
-    // First check in-memory cache
-    pub async fn get_upload_status(
-        &self,
-        task_id: &str,
-        user_id: i32,
-    ) -> Result<UploadStatus, ServiceError> {
-        {
-            let tasks = self.tasks.read().await;
-            if let Some(task_info) = tasks.get(task_id) {
-                // 1 hour cache
-                if task_info.status.started_at.timestamp() > (Utc::now().timestamp() - 3600) {
-                    return Ok(task_info.status.clone());
-                }
-            }
-        }
-
-        // Fall back to database
-        let mut conn = self.db_pool.get_conn().await?;
-        let result: Option<Row> = conn
-            .exec_first(
-                r"SELECT status, cid, error, progress, started_at, user_id 
-                  FROM upload_tasks 
-                  WHERE task_id = :task_id",
-                params! { "task_id" => task_id },
-            )
-            .await?;
-
-        match result {
-            Some(row) => {
-                let db_user_id: i32 = row.get(5).unwrap();
-                if db_user_id != user_id {
-                    return Err(ServiceError::Auth(
-                        "Not authorized to view this task".to_string(),
-                    ));
-                }
-
-                let started_at: String = row.get(4).unwrap();
-                let started_at = NaiveDateTime::parse_from_str(&started_at, "%Y-%m-%d %H:%M:%S")
-                    .map(|ndt| Utc.from_utc_datetime(&ndt))
-                    .unwrap_or_else(|_| Utc::now());
-
-                let status = UploadStatus {
-                    task_id: task_id.to_string(),
-                    status: row.get(0).unwrap(),
-                    cid: row.get(1),
-                    error: row.get(2),
-                    progress: row.get(3),
-                    started_at,
-                };
-
-                let mut tasks = self.tasks.write().await;
-                tasks.insert(
-                    task_id.to_string(),
-                    TaskInfo {
-                        status: status.clone(),
-                        tx: None,
-                    },
-                );
-
-                Ok(status)
-            }
-            None => Err(ServiceError::InvalidInput("Task not found".to_string())),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn download_file(
-        &self,
-        cid: &str,
-        output_path: &str,
-        user_id: i32,
-    ) -> Result<(), ServiceError> {
-        let metadata = self
-            .get_file_metadata(cid)
-            .await?
-            .ok_or(ServiceError::InvalidInput("File not found".to_string()))?;
-
-        if metadata.user_id != user_id {
-            return Err(ServiceError::Auth(
-                "Not authorized to access this file".to_string(),
-            ));
-        }
-
-        let mut stream = self.client.cat(cid);
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            bytes.extend(
-                chunk.map_err(|e| ServiceError::Internal(format!("Download failed: {}", e)))?,
-            );
-        }
-
-        std::fs::write(output_path, &bytes)
-            .map_err(|e| ServiceError::Internal(format!("Failed to write file: {}", e)))?;
-        info!("File downloaded by user {}: {}", user_id, cid);
-        Ok(())
     }
 
     /// Fetches file bytes from IPFS for direct serving
