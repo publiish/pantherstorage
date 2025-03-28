@@ -1,8 +1,8 @@
 use crate::{
     config::Config,
     database::{
-        cleanup_failed_upload, init_schema, insert_file_metadata, insert_initial_task, login_user,
-        register_user, update_task_status,
+        cleanup_expired_tasks, cleanup_failed_upload, init_schema, insert_file_metadata,
+        insert_initial_task, login_user, register_user, update_task_status,
     },
     errors::ServiceError,
     models::{
@@ -13,6 +13,7 @@ use crate::{
     utils::upload_to_ipfs,
 };
 use chrono::{Duration, NaiveDateTime, TimeZone, Utc};
+use dashmap::DashMap;
 use futures::Stream;
 use futures_util::StreamExt;
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
@@ -24,8 +25,8 @@ use pqcrypto_traits::sign::{
     SecretKey as OtherSecretKey,
 };
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{oneshot, RwLock, Semaphore};
+use std::sync::Arc;
+use tokio::sync::{oneshot, Semaphore};
 use uuid::Uuid;
 
 use base64::engine::general_purpose::STANDARD as Base64Engine;
@@ -40,7 +41,7 @@ pub struct IPFSService {
     // Dilithium public key
     pub public_key: PublicKey,
     // In-memory task tracking
-    pub tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
+    pub tasks: Arc<DashMap<String, TaskInfo>>,
     // Cap concurrent uploads
     operation_semaphore: Arc<Semaphore>,
     #[allow(dead_code)]
@@ -50,50 +51,68 @@ pub struct IPFSService {
 impl IPFSService {
     /// Initializes a new IPFS service instance
     pub async fn new(config: &Config) -> Result<Self, ServiceError> {
-        let client = IpfsClient::from_str(&config.ipfs_node)?;
-        let version = client.version().await?;
+        let client = IpfsClient::from_str(&config.ipfs_node)
+            .map_err(|e| ServiceError::Internal(format!("Failed to connect to IPFS: {}", e)))?;
+        let version = client
+            .version()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to get IPFS version: {}", e)))?;
         info!(
             "Connected to IPFS node: {} (version: {})",
             config.ipfs_node, version.version
         );
 
-        let opts = Opts::from_url(&config.database_url)?;
+        let opts = Opts::from_url(&config.database_url)
+            .map_err(|e| ServiceError::Internal(format!("Invalid database URL: {}", e)))?;
         let pool = Pool::new(opts);
 
         // Initialize database schema
-        init_schema(&pool).await?;
+
+        init_schema(&pool)
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to initialize schema: {}", e)))?;
 
         let public_key = config
             .get_public_key()
-            .map_err(|e| ServiceError::Internal(e))?;
+            .map_err(|e| ServiceError::Internal(format!("Failed to get public key: {}", e)))?;
         let signing_key = config
             .get_secret_key()
-            .map_err(|e| ServiceError::Internal(e))?;
-
-        // Get the bytes for logging
-        let public_key_bytes = public_key.as_bytes();
-        let secret_key_bytes = signing_key.as_bytes();
+            .map_err(|e| ServiceError::Internal(format!("Failed to get secret key: {}", e)))?;
 
         // Log the Public keys as Base64 strings
         info!(
             "Public Key (Base64): {}",
-            Base64Engine.encode(&public_key_bytes)
+            Base64Engine.encode(public_key.as_bytes())
         );
-        // Log the SecretKey (! in Production)
-        info!(
-            "Secret Key (Base64): {}",
-            Base64Engine.encode(&secret_key_bytes)
-        );
+        // ! in Production
+        if cfg!(debug_assertions) {
+            info!(
+                "Secret Key (Base64): {}",
+                Base64Engine.encode(signing_key.as_bytes())
+            );
+        }
 
-        Ok(Self {
+        let service = Self {
             client,
             db_pool: pool,
             url: config.ipfs_node.clone(),
             signing_key,
             public_key,
-            tasks: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(DashMap::new()),
             operation_semaphore: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
-        })
+        };
+
+        // Spawn a background task to clean up expired tasks every 5 minutes
+        let tasks_clone = service.tasks.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::minutes(5).to_std().unwrap());
+            loop {
+                interval.tick().await;
+                let _ = cleanup_expired_tasks(tasks_clone.clone()).await;
+            }
+        });
+
+        Ok(service)
     }
 
     /// Generates a PQC authentication token for a given user ID
@@ -112,8 +131,10 @@ impl IPFSService {
             nonce: Uuid::new_v4().to_string(),
         };
 
-        let header_json = serde_json::to_string(&header)?;
-        let payload_json = serde_json::to_string(&claims)?;
+        let header_json = serde_json::to_string(&header)
+            .map_err(|e| ServiceError::Internal(format!("Failed to serialize header: {}", e)))?;
+        let payload_json = serde_json::to_string(&claims)
+            .map_err(|e| ServiceError::Internal(format!("Failed to serialize claims: {}", e)))?;
         let header_encoded = Base64Engine.encode(header_json);
         let payload_encoded = Base64Engine.encode(payload_json);
 
@@ -132,7 +153,8 @@ impl IPFSService {
     /// Registers a new user and returns a PQC Auth token
     pub async fn signup(&self, req: SignupRequest) -> Result<String, ServiceError> {
         let user_id = register_user(&self.db_pool, &req).await?;
-        let token = self.generate_token(user_id, Duration::hours(12))?;
+        let token = self.generate_token(user_id, Duration::hours(6))?;
+        info!("User signed up: {}", user_id);
         Ok(token)
     }
 
@@ -140,9 +162,11 @@ impl IPFSService {
     pub async fn signin(&self, req: SigninRequest) -> Result<String, ServiceError> {
         let user_id = login_user(&self.db_pool, &req).await?;
         let token = self.generate_token(user_id, Duration::hours(12))?;
+        info!("User signed in: {}", user_id);
         Ok(token)
     }
 
+    /// Verifies a PQC authentication token
     pub fn verify_token(&self, token: &str) -> Result<Claims, ServiceError> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
@@ -153,18 +177,26 @@ impl IPFSService {
         let payload_encoded = parts[1];
         let signature_encoded = parts[2];
 
-        let header_json = Base64Engine.decode(header_encoded)?;
-        let header: TokenHeader = serde_json::from_slice(&header_json)?;
+        let header_json = Base64Engine
+            .decode(header_encoded)
+            .map_err(|e| ServiceError::Auth(format!("Failed to decode header: {}", e)))?;
+        let header: TokenHeader = serde_json::from_slice(&header_json)
+            .map_err(|e| ServiceError::Auth(format!("Failed to parse header: {}", e)))?;
         if header.alg != "Dilithium5" || header.typ != "PQC" {
             return Err(ServiceError::Auth(
                 "Unsupported algorithm or type".to_string(),
             ));
         }
 
-        let payload_json = Base64Engine.decode(payload_encoded)?;
-        let mut claims: Claims = serde_json::from_slice(&payload_json)?;
+        let payload_json = Base64Engine
+            .decode(payload_encoded)
+            .map_err(|e| ServiceError::Auth(format!("Failed to decode payload: {}", e)))?;
+        let mut claims: Claims = serde_json::from_slice(&payload_json)
+            .map_err(|e| ServiceError::Auth(format!("Failed to parse claims: {}", e)))?;
 
-        let provided_signature_hash = Base64Engine.decode(signature_encoded)?;
+        let provided_signature_hash = Base64Engine
+            .decode(signature_encoded)
+            .map_err(|e| ServiceError::Auth(format!("Failed to decode signature: {}", e)))?;
         if provided_signature_hash.len() != 32 {
             return Err(ServiceError::Auth("Invalid signature length".to_string()));
         }
@@ -236,8 +268,7 @@ impl IPFSService {
         Ok(metadata)
     }
 
-    /// Return a pending status and task ID immediately and processes the upload
-    /// asynchronously in the background allowing status checking later.
+    /// Returns a pending status and task ID immediately, processing the upload asynchronously
     pub async fn upload_file<S>(
         &self,
         file_stream: S,
@@ -265,17 +296,13 @@ impl IPFSService {
         let (tx, _rx) = oneshot::channel();
 
         // Store task info
-        {
-            let mut tasks = self.tasks.write().await;
-            tasks.insert(
-                task_id.clone(),
-                TaskInfo {
-                    status: status.clone(),
-                    tx: Some(tx),
-                },
-            );
-        }
-
+        self.tasks.insert(
+            task_id.clone(),
+            TaskInfo {
+                status: status.clone(),
+                tx: Some(tx),
+            },
+        );
         // Store initial task in database
         insert_initial_task(
             &self.db_pool,
@@ -365,6 +392,7 @@ impl IPFSService {
         Ok(status)
     }
 
+    /// Processes an asynchronous file upload
     async fn process_upload<S>(
         client: IpfsClient,
         db_pool: Pool,
@@ -372,7 +400,7 @@ impl IPFSService {
         file_name: String,
         user_id: i32,
         task_id: String,
-        tasks: Arc<RwLock<HashMap<String, TaskInfo>>>,
+        tasks: Arc<DashMap<String, TaskInfo>>,
     ) -> Result<FileMetadata, ServiceError>
     where
         S: Stream<Item = Result<Vec<u8>, ServiceError>> + Send + Sync + Unpin + 'static,
@@ -411,7 +439,7 @@ impl IPFSService {
         .await?;
 
         // Send the result back using the tx field
-        if let Some(task_info) = tasks.write().await.get_mut(&task_id) {
+        if let Some(mut task_info) = tasks.get_mut(&task_id) {
             if let Some(tx) = task_info.tx.take() {
                 let _ = tx.send(Ok(metadata.clone()));
             }
@@ -461,7 +489,10 @@ impl IPFSService {
             ));
         }
 
-        let mut conn = self.db_pool.get_conn().await?;
+        let mut conn =
+            self.db_pool.get_conn().await.map_err(|e| {
+                ServiceError::Internal(format!("Failed to get DB connection: {}", e))
+            })?;
         let mut tx = conn
             .start_transaction(mysql_async::TxOpts::default())
             .await
@@ -475,7 +506,6 @@ impl IPFSService {
         .map_err(|e| ServiceError::Internal(format!("Failed to delete metadata: {}", e)))?;
 
         let affected_rows = tx.affected_rows();
-
         if affected_rows == 0 {
             return Err(ServiceError::Internal(
                 "Failed to delete metadata: no rows affected".to_string(),
@@ -510,7 +540,6 @@ impl IPFSService {
             .map_err(|e| ServiceError::Internal(format!("Failed to commit transaction: {}", e)))?;
 
         info!("File deleted successfully by user {}: CID {}", user_id, cid);
-
         // Note: Garbage collection (`repo_gc`) is not directly supported by `ipfs_api`.
         // If needed, we need to implement a custom HTTP call to the IPFS API endpoint `/repo/gc`.
         log::info!("Skipping garbage collection for CID {}", cid);
@@ -520,30 +549,37 @@ impl IPFSService {
 
     /// Lists all pinned files for a user
     pub async fn list_pins(&self, user_id: i32) -> Result<Vec<String>, ServiceError> {
-        let mut conn = self.db_pool.get_conn().await?;
+        let mut conn =
+            self.db_pool.get_conn().await.map_err(|e| {
+                ServiceError::Internal(format!("Failed to get DB connection: {}", e))
+            })?;
         let cids: Vec<String> = conn
             .exec_map(
                 "SELECT cid FROM file_metadata WHERE user_id = :user_id",
                 params! { "user_id" => user_id },
                 |cid| cid,
             )
-            .await?;
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to list pins: {}", e)))?;
 
         Ok(cids)
     }
 
     /// Retrieves metadata for a specific file
     pub async fn get_file_metadata(&self, cid: &str) -> Result<Option<FileMetadata>, ServiceError> {
-        let mut conn = self.db_pool.get_conn().await?;
+        let mut conn =
+            self.db_pool.get_conn().await.map_err(|e| {
+                ServiceError::Internal(format!("Failed to get DB connection: {}", e))
+            })?;
         let result: Option<Row> = conn
             .exec_first(
                 "SELECT cid, name, size, timestamp, user_id FROM file_metadata WHERE cid = :cid",
                 params! { "cid" => cid },
             )
-            .await?;
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Failed to get file metadata: {}", e)))?;
 
         Ok(result.map(|row| {
-            // Handle the timestamp value properly
             let timestamp_value: Value = row.get(3).unwrap();
             let timestamp = match timestamp_value {
                 Value::Date(year, month, day, hour, minute, second, micro) => NaiveDateTime::new(
@@ -560,7 +596,10 @@ impl IPFSService {
                     // Fallback to parsing from string if needed
                     let timestamp_str: String = row.get::<String, _>(3).unwrap();
                     NaiveDateTime::parse_from_str(&timestamp_str, "%Y-%m-%d %H:%M:%S")
-                        .unwrap_or_else(|_| Utc::now().naive_utc())
+                        .unwrap_or_else(|e| {
+                            log::warn!("Failed to parse timestamp: {}, defaulting to now", e);
+                            Utc::now().naive_utc()
+                        })
                 }
             };
             let timestamp_utc = Utc.from_utc_datetime(&timestamp);
