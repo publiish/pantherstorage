@@ -18,6 +18,7 @@ mod stream;
 mod utils;
 
 use config::Config;
+use middleware::rate_limiter::UserRateLimiter;
 use services::ipfs_service::IPFSService;
 
 // Post-quantum crypto imports
@@ -106,8 +107,7 @@ async fn start_server() -> io::Result<()> {
     let app_state = routes::AppState {
         ipfs_service: ipfs_service.clone(),
     };
-    // 100 reqs per minute
-    let rate_limiter = services::rate_limiter::RateLimiter::new(100, 60);
+    let rate_limiter = UserRateLimiter::new();
 
     start_task_cleanup(ipfs_service.clone());
 
@@ -133,7 +133,7 @@ async fn start_server() -> io::Result<()> {
 }
 
 /// Spawns a background task to periodically clean up old tasks
-fn start_task_cleanup(ipfs_service: std::sync::Arc<IPFSService>) {
+fn start_task_cleanup(ipfs_service: Arc<IPFSService>) {
     tokio::spawn(async move {
         // Cleanup every 2 hours
         let mut interval = interval(Duration::from_secs(7200));
@@ -144,6 +144,7 @@ fn start_task_cleanup(ipfs_service: std::sync::Arc<IPFSService>) {
                 Ok(()) => log::info!("Task cleanup completed successfully"),
                 Err(e) => log::error!("Task cleanup failed: {}", e),
             }
+            ipfs_service.cleanup_rate_limiters().await;
         }
     });
 }
