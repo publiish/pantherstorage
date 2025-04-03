@@ -5,6 +5,7 @@ use crate::{
         insert_initial_task, login_user, register_user, update_task_status,
     },
     errors::ServiceError,
+    middleware::rate_limiter::{cleanup_rate_limiters, RateLimiterEntry},
     models::{
         auth::{Claims, TokenHeader},
         file_metadata::*,
@@ -46,6 +47,9 @@ pub struct IPFSService {
     operation_semaphore: Arc<Semaphore>,
     #[allow(dead_code)]
     pub url: String,
+    // Rate limiters for IP-based / user-specific request throttling
+    // Managed via the `governor` crate to prevent excessive API usage
+    pub rate_limiters: Arc<DashMap<String, RateLimiterEntry>>,
 }
 
 impl IPFSService {
@@ -100,6 +104,7 @@ impl IPFSService {
             public_key,
             tasks: Arc::new(DashMap::new()),
             operation_semaphore: Arc::new(Semaphore::new(config.max_concurrent_uploads)),
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Spawn a background task to clean up expired tasks every 5 minutes
@@ -109,6 +114,16 @@ impl IPFSService {
             loop {
                 interval.tick().await;
                 let _ = cleanup_expired_tasks(tasks_clone.clone()).await;
+            }
+        });
+
+        // Start rate limiter cleanup task
+        let rate_limiters = Arc::clone(&service.rate_limiters);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                cleanup_rate_limiters(rate_limiters.clone()).await;
             }
         });
 
@@ -612,5 +627,10 @@ impl IPFSService {
                 user_id: row.get(4).unwrap(),
             }
         }))
+    }
+
+    /// Cleanup rate limiters for the service instance
+    pub async fn cleanup_rate_limiters(&self) {
+        cleanup_rate_limiters(self.rate_limiters.clone()).await;
     }
 }

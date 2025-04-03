@@ -229,7 +229,11 @@ Run the built binary:
 
 Generate the `Dilithium keys` and update `.env` file with `DILITHIUM_PUBLIC_KEY` and `DILITHIUM_PRIVATE_KEY`:
 ```sh
-cargo run -- generate-keys --base64
+cargo run -- generate-keys
+```
+
+```sh
+cargo run -- generate-keys --output ./keys
 ```
 
 ## API Documentation
