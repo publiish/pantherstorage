@@ -20,7 +20,7 @@ mod utils;
 use config::Config;
 use middleware::rate_limiter::UserRateLimiter;
 use services::ipfs_service::IPFSService;
-
+use services::brand_service::BrandService;
 // Post-quantum crypto imports
 use pqcrypto_dilithium::dilithium5;
 use pqcrypto_kyber::kyber1024;
@@ -60,21 +60,16 @@ async fn main() -> io::Result<()> {
 }
 
 fn generate_keys(output_dir: &str) -> io::Result<()> {
-    // Ensure output directory exists
     std::fs::create_dir_all(output_dir)?;
 
-    // Generate Kyber1024 KEM keys
     let (pk_kem, sk_kem) = kyber1024::keypair();
-    // Generate Dilithium5 signature keys
     let (pk_sign, sk_sign) = dilithium5::keypair();
 
-    // Save keys in Base64 for consistency and portability
     let pk_kem_b64 = Base64Engine.encode(pk_kem.as_bytes());
     let sk_kem_b64 = Base64Engine.encode(sk_kem.as_bytes());
     let pk_sign_b64 = Base64Engine.encode(pk_sign.as_bytes());
     let sk_sign_b64 = Base64Engine.encode(sk_sign.as_bytes());
 
-    // Save Base64 encoded keys
     std::fs::write(format!("{}/kyber1024_public.key", output_dir), pk_kem_b64)?;
     std::fs::write(format!("{}/kyber1024_secret.key", output_dir), sk_kem_b64)?;
     std::fs::write(format!("{}/dilithium5_public.key", output_dir), pk_sign_b64)?;
@@ -94,19 +89,29 @@ fn generate_keys(output_dir: &str) -> io::Result<()> {
 
 async fn start_server() -> io::Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
     let config = Config::from_env().map_err(|e| {
         log::error!("Failed to load configuration: {}", e);
         io::Error::new(io::ErrorKind::Other, "Configuration loading failed")
     })?;
 
-    let ipfs_service = IPFSService::new(&config).await.map_err(|e| {
-        log::error!("Failed to initialize IPFS service: {}", e);
-        io::Error::new(io::ErrorKind::Other, "IPFS service initialization failed")
-    })?;
-    let ipfs_service = Arc::new(ipfs_service);
+    let db_pool = database::create_pool(&config.database_url); // ✅ NEW
+
+    let ipfs_service = Arc::new(
+        IPFSService::new(&config).await.map_err(|e| {
+            log::error!("Failed to initialize IPFS service: {}", e);
+            io::Error::new(io::ErrorKind::Other, "IPFS service initialization failed")
+        })?,
+    );
+
+    let brand_service = Arc::new(BrandService::new(db_pool.clone())); // ✅ FIXED
+    
+    
     let app_state = routes::AppState {
         ipfs_service: ipfs_service.clone(),
+        brand_service: brand_service.clone(),
     };
+
     let rate_limiter = UserRateLimiter::new();
 
     start_task_cleanup(ipfs_service.clone());
@@ -121,7 +126,6 @@ async fn start_server() -> io::Result<()> {
             .wrap(rate_limiter.clone())
             .configure(routes::init_routes)
     })
-    // Use number of CPUs, capped at 8
     .workers(num_cpus::get().min(8))
     .bind(&bind_address)
     .map_err(|e| {
@@ -132,15 +136,12 @@ async fn start_server() -> io::Result<()> {
     .await
 }
 
-/// Spawns a background task to periodically clean up old tasks
 fn start_task_cleanup(ipfs_service: Arc<IPFSService>) {
     tokio::spawn(async move {
-        // Cleanup every 2 hours
         let mut interval = interval(Duration::from_secs(7200));
         loop {
             interval.tick().await;
-            match utils::cleanup_old_tasks(&ipfs_service.db_pool, ipfs_service.tasks.clone()).await
-            {
+            match utils::cleanup_old_tasks(&ipfs_service.db_pool, ipfs_service.tasks.clone()).await {
                 Ok(()) => log::info!("Task cleanup completed successfully"),
                 Err(e) => log::error!("Task cleanup failed: {}", e),
             }

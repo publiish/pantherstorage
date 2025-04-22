@@ -1,6 +1,11 @@
 mod schema;
 mod users;
 
+mod brand;
+
+pub use brand::{get_brand_stats, register_brand_did, update_brand_profile};
+
+
 pub use schema::init_schema;
 pub use users::{login_user, register_user};
 
@@ -253,4 +258,8 @@ pub async fn cleanup_expired_tasks(
     }
 
     Ok(())
+}
+
+pub fn create_pool(database_url: &str) -> Pool {
+    Pool::new(database_url)
 }

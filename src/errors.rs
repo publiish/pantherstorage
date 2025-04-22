@@ -6,27 +6,39 @@ use serde_json::Error as SerdeJsonError;
 use std::sync::PoisonError;
 use thiserror::Error;
 
-/// Possible errors that can occur in the service
+/// All service-level errors that can be returned by the API.
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("Database error: {0}")]
     Database(#[from] mysql_async::Error),
+
     #[error("IPFS error: {0}")]
     Ipfs(#[from] ipfs_api::Error),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
     #[error("Invalid URI: {0}")]
     InvalidUri(#[from] InvalidUri),
+
     #[error("URL parsing error: {0}")]
     UrlError(#[from] mysql_async::UrlError),
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
     #[error("Internal server error: {0}")]
     Internal(String),
+
     #[error("Authentication error: {0}")]
     Auth(String),
+
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Brand not found")]
+    NotFound,
+    
     #[error("Rate limit exceeded")]
     RateLimit,
 }
@@ -49,7 +61,6 @@ impl actix_web::error::ResponseError for ServiceError {
     }
 }
 
-// From implementations for completeness
 impl From<bcrypt::BcryptError> for ServiceError {
     fn from(err: bcrypt::BcryptError) -> Self {
         ServiceError::Internal(format!("Password hashing error: {}", err))
@@ -68,7 +79,6 @@ impl From<actix_multipart::MultipartError> for ServiceError {
     }
 }
 
-// Handle mutex poisoning
 impl<T> From<PoisonError<T>> for ServiceError {
     fn from(err: PoisonError<T>) -> Self {
         ServiceError::Internal(format!("Mutex lock failed: {}", err))
@@ -87,9 +97,9 @@ impl From<Base64DecodeError> for ServiceError {
     }
 }
 
-/// Error response for API endpoints
+/// Error response returned to the client.
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
-    error: String,
-    message: String,
+    pub error: String,
+    pub message: String,
 }

@@ -50,6 +50,23 @@ pub async fn init_schema(pool: &Pool) -> Result<(), mysql_async::Error> {
     )
     .await?;
 
+    conn.query_drop(
+        r"CREATE TABLE IF NOT EXISTS brands (
+            id BIGINT PRIMARY KEY,
+            brand_name VARCHAR(255) NOT NULL,
+            brand_url VARCHAR(255),
+            magic_link_id VARCHAR(255) NOT NULL,
+            did VARCHAR(255),
+            dao_id BIGINT,
+            sub_domain VARCHAR(255),
+            write_permission BOOLEAN NOT NULL,
+            delete_permission BOOLEAN NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .await?;
+
     info!("Database schema initialized");
     Ok(())
 }
